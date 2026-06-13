@@ -1,0 +1,5 @@
+# 含真实飞书密钥/本机路径，绝不上库
+config.json
+__pycache__/
+*.pyc
+*.log
