@@ -13,7 +13,7 @@ echo "  停止: 关闭本窗口，或按 Ctrl-C"
 echo "================================================"
 
 while true; do
-  python3 feishu_claude_bridge.py
+  python3 src/feishu_claude_bridge.py
   code=$?
   # 不重启的退出码：0=正常 130=Ctrl-C 1=配置等致命错误 127=找不到 python3
   # 这些重启也无济于事，避免每 3 秒疯狂重启刷屏。

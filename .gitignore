@@ -2,6 +2,11 @@
 config.json
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.DS_Store
 *.log
 .claude/settings.local.json
 .inbox/

@@ -9,6 +9,24 @@
 
 - 暂无
 
+## [0.0.4] - 2026-06-16
+
+### 修复
+
+- 配置路径现在会展开 `~` 和环境变量，避免照抄 `state_dir: "~/.feishu_bridge"` 时生成字面量 `~` 目录。
+- 启动时间闸门提前记录，避免启动期网络探测耗时导致新消息被误判为旧消息。
+- 群聊 @ 判断改为 fail-closed：拿不到机器人 `open_id` 时暂不响应群聊 @，避免退化成“任意 @ 都触发”。
+- `sessions.json` 损坏时会备份为 `.corrupt-*` 文件并记录警告，不再静默丢失上下文映射。
+
+### 安全
+
+- 附件下载增加默认 25MB 单文件上限，并对落地文件名做清洗和唯一化，减少内存占用和路径/覆盖风险。
+
+### 维护
+
+- 整理项目结构：核心脚本移动到 `src/feishu_claude_bridge.py`，新增 `config.example.json` 配置模板。
+- 新增不依赖飞书网络的核心单元测试，覆盖配置路径、群聊 @ 判断、session 损坏备份、消息解析和附件大小限制。
+
 ## [0.0.3] - 2026-06-16
 
 ### 新增
@@ -60,7 +78,8 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.3...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/releases/tag/v0.0.1

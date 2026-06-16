@@ -17,10 +17,11 @@ feishu_claude_bridge.py
   - 多 session 并行隔离：不同会话独立进程；同会话加锁串行
   - 命令：发送 /new 或 /reset 在当前会话开启一个全新 session
 
-配置：全部读自脚本同目录的 config.json（不入库），字段见 README。
+配置：默认读项目根目录的 config.json（不入库），字段见 README。
   必填: app_id, app_secret
   可选: model(默认 claude-opus-4-8) / workdir / state_dir / timeout /
-        session_scope(chat_user|chat|user) / allowed_tools / allowed_chats
+        max_attachment_bytes / session_scope(chat_user|chat|user) /
+        allowed_tools / allowed_chats
   可用环境变量 BRIDGE_CONFIG 指定其它配置文件路径。
 """
 import json
@@ -43,13 +44,22 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
+# 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
+START_TIME_MS = time.time() * 1000
+
+
+def _expand_path(path: str) -> str:
+    """展开配置里的 ~ 和环境变量，并转成绝对路径。"""
+    return os.path.abspath(os.path.expandvars(os.path.expanduser(str(path))))
+
 
 # ---------- 配置 ----------
-# 所有可变项集中在脚本同目录的 config.json（不入库，见 README「配置」）。
+# 所有可变项集中在项目根目录的 config.json（不入库，见 README「配置」）。
 # 只有 app_id / app_secret 必填，其余缺省即可。可用 BRIDGE_CONFIG 指定别的路径。
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.environ.get("BRIDGE_CONFIG", os.path.join(BASE_DIR, "config.json"))
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(SRC_DIR)
+CONFIG_FILE = _expand_path(os.environ.get("BRIDGE_CONFIG", os.path.join(BASE_DIR, "config.json")))
 try:
     with open(CONFIG_FILE, encoding="utf-8") as _f:
         _conf = json.load(_f)
@@ -68,15 +78,18 @@ APP_SECRET = _conf["app_secret"]
 # claude -p 使用的模型 ID
 CLAUDE_MODEL = _conf.get("model", "claude-opus-4-8")
 # claude 固定运行目录（决定会话上下文/CLAUDE.md 归属），默认脚本所在目录
-WORKDIR = _conf.get("workdir") or BASE_DIR
+WORKDIR = _expand_path(_conf.get("workdir") or BASE_DIR)
 # session 持久化目录
-STATE_DIR = _conf.get("state_dir") or os.path.expanduser("~/.feishu_bridge")
+STATE_DIR = _expand_path(_conf.get("state_dir") or "~/.feishu_bridge")
 SESSIONS_FILE = os.path.join(STATE_DIR, "sessions.json")
 # 用户发来的图片/文件下载到这里，处理完即删。
 # 放在 WORKDIR 下（而非 STATE_DIR）：claude -p 以 WORKDIR 为工作目录，
 # 沙箱通常只允许读工作目录内的文件，放这里才能被 Read 工具读到。
 INBOX_DIR = os.path.join(WORKDIR, ".inbox")
 CLAUDE_TIMEOUT = int(_conf.get("timeout", 600))
+MAX_ATTACHMENT_BYTES = int(_conf.get("max_attachment_bytes", 25 * 1024 * 1024))
+if MAX_ATTACHMENT_BYTES <= 0:
+    raise SystemExit("❌ 配置错误: max_attachment_bytes 必须大于 0")
 # 会话作用域：
 #   chat_user(默认) 群里按“群+人”分 session：同群不同人各自独立、并行执行
 #   chat            整个群共用一个 session（群内串行、共享上下文）
@@ -98,10 +111,14 @@ ALLOWED_CHATS = set(_allow) if _allow else None
 
 client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
 _MENTION_RE = re.compile(r"@_user_\d+")
+_BOT_OPEN_ID: str | None = None
+_BOT_OPEN_ID_RETRY_SECONDS = 60
+_BOT_OPEN_ID_LAST_ATTEMPT = -_BOT_OPEN_ID_RETRY_SECONDS
+_BOT_OPEN_ID_LOCK = threading.Lock()
 
 
 def _get_bot_open_id() -> str | None:
-    """启动时取 bot 自身 open_id，用于精确判断群里是否 @ 了机器人。"""
+    """取 bot 自身 open_id，用于精确判断群里是否 @ 了机器人。"""
     try:
         req = urllib.request.Request(
             "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
@@ -116,11 +133,25 @@ def _get_bot_open_id() -> str | None:
         info = json.loads(urllib.request.urlopen(req2, timeout=15).read())
         return (info.get("bot") or {}).get("open_id")
     except Exception as e:  # noqa: BLE001
-        print(f"[warn] 取 bot open_id 失败，群内将退化为“任意@即响应”：{e}")
+        print(f"[warn] 取 bot open_id 失败，群聊将暂不响应 @ 以避免误触发：{e}")
         return None
 
 
-BOT_OPEN_ID = _get_bot_open_id()
+def _get_bot_open_id_cached() -> str | None:
+    """懒加载 bot open_id；失败后限频重试，群聊在拿不到时 fail-closed。"""
+    global _BOT_OPEN_ID, _BOT_OPEN_ID_LAST_ATTEMPT
+    if _BOT_OPEN_ID:
+        return _BOT_OPEN_ID
+    now = time.monotonic()
+    if now - _BOT_OPEN_ID_LAST_ATTEMPT < _BOT_OPEN_ID_RETRY_SECONDS:
+        return None
+    with _BOT_OPEN_ID_LOCK:
+        now = time.monotonic()
+        if _BOT_OPEN_ID or now - _BOT_OPEN_ID_LAST_ATTEMPT < _BOT_OPEN_ID_RETRY_SECONDS:
+            return _BOT_OPEN_ID
+        _BOT_OPEN_ID_LAST_ATTEMPT = now
+        _BOT_OPEN_ID = _get_bot_open_id()
+        return _BOT_OPEN_ID
 
 # ---------- session 持久化 + 并发隔离 ----------
 _sessions_guard = threading.Lock()
@@ -130,9 +161,6 @@ _keylocks: dict[str, threading.Lock] = {}
 _DEDUP: dict[str, float] = {}
 _DEDUP_LOCK = threading.Lock()
 _DEDUP_TTL = 30  # 秒
-# 进程启动时刻（毫秒）。飞书 at-least-once 投递：重启后会重投上次未 ack 的旧事件，
-# 内存去重表已清空认不出，导致重复执行。用它丢弃“启动之前产生”的消息。
-START_TIME_MS = time.time() * 1000
 
 
 def _ts() -> str:
@@ -155,8 +183,23 @@ def _seen_recently(message_id: str) -> bool:
 def _load_sessions() -> dict:
     try:
         with open(SESSIONS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:  # noqa: BLE001
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        print(f"[warn] sessions 文件不是对象，忽略: {SESSIONS_FILE}")
+        return {}
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        backup = SESSIONS_FILE + ".corrupt-" + time.strftime("%Y%m%d-%H%M%S")
+        try:
+            os.replace(SESSIONS_FILE, backup)
+            print(f"[warn] sessions 文件损坏，已备份到 {backup}: {e}")
+        except OSError as oe:
+            print(f"[warn] sessions 文件损坏且备份失败: {e}; backup_error={oe}")
+        return {}
+    except OSError as e:
+        print(f"[warn] 读取 sessions 文件失败，临时使用空会话映射: {e}")
         return {}
 
 
@@ -455,11 +498,12 @@ def _bot_mentioned(msg) -> bool:
     mentions = getattr(msg, "mentions", None) or []
     if not mentions:
         return False
-    if BOT_OPEN_ID is None:
-        return True  # 退化：群里有任意 @ 就响应
+    bot_open_id = _get_bot_open_id_cached()
+    if bot_open_id is None:
+        return False
     for m in mentions:
         mid = getattr(m, "id", None)
-        if mid and getattr(mid, "open_id", None) == BOT_OPEN_ID:
+        if mid and getattr(mid, "open_id", None) == bot_open_id:
             return True
     return False
 
@@ -470,25 +514,54 @@ _IMG_EXT_BY_CTYPE = {
 }
 
 
+def _safe_filename(name: str, fallback: str = "file") -> str:
+    """把飞书文件名压成安全的单文件名，避免目录穿越和奇怪控制字符。"""
+    safe = os.path.basename(name or fallback).strip()
+    safe = re.sub(r"[^0-9A-Za-z._ -]+", "_", safe).strip(" .")
+    return (safe or fallback)[:120]
+
+
 def _download_resource(message_id: str, file_key: str, rtype: str, name: str = "") -> str | None:
     """下载消息里的图片/文件资源到 INBOX_DIR，返回本地路径；失败返回 None。
     rtype: 'image'（图片）| 'file'（文件）。"""
+    path = ""
     try:
         token = _get_tenant_token()
         url = (f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}"
                f"/resources/{file_key}?type={rtype}")
         req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
         with urllib.request.urlopen(req, timeout=60) as resp:
-            data = resp.read()
             ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
-        safe = os.path.basename(name or file_key)  # 防目录穿越
-        if "." not in safe:  # 没扩展名（多为图片）→ 按 Content-Type 补一个
-            safe += _IMG_EXT_BY_CTYPE.get(ctype, ".png" if rtype == "image" else ".bin")
-        path = os.path.join(INBOX_DIR, f"{message_id}_{safe}")
-        with open(path, "wb") as f:
-            f.write(data)
+            clen = resp.headers.get("Content-Length")
+            try:
+                expected_size = int(clen) if clen else 0
+            except ValueError:
+                expected_size = 0
+            if expected_size > MAX_ATTACHMENT_BYTES:
+                raise ValueError(f"附件过大: {expected_size} > {MAX_ATTACHMENT_BYTES} bytes")
+
+            safe = _safe_filename(name, file_key)
+            if "." not in safe:  # 没扩展名（多为图片）→ 按 Content-Type 补一个
+                safe += _IMG_EXT_BY_CTYPE.get(ctype, ".png" if rtype == "image" else ".bin")
+            msg_prefix = _safe_filename(message_id, "message")
+            path = os.path.join(INBOX_DIR, f"{msg_prefix}_{uuid.uuid4().hex[:8]}_{safe}")
+            total = 0
+            with open(path, "wb") as f:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_ATTACHMENT_BYTES:
+                        raise ValueError(f"附件过大: > {MAX_ATTACHMENT_BYTES} bytes")
+                    f.write(chunk)
         return path
     except Exception as e:  # noqa: BLE001
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         print(f"[resource download error] {e} key={file_key} type={rtype}")
         return None
 
