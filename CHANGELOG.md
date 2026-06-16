@@ -9,6 +9,15 @@
 
 - 暂无
 
+## [0.0.3] - 2026-06-16
+
+### 新增
+
+- **接收图片与文件**：放开此前"仅文本"的限制，现在支持 `image`（图片）、`file`（文件）、`post`（富文本，含其中夹带的图片/文件）消息。桥会把图片/文件下载到本地 `WORKDIR/.inbox`，把路径拼进提示词交给 `claude -p`，由 Claude 用 Read 等工具查看后处理（如截图识别、营业执照/名片提取、PDF 阅读等）。处理完自动删除临时文件。
+  - 下载目录放在 `WORKDIR/.inbox`（而非 `state_dir`），以适配 `claude -p` 沙箱通常只允许读工作目录内文件的限制。
+  - 群聊中仍需 @ 机器人才响应；私聊直接处理。
+  - 下载失败时降级提示用户重发，不静默丢弃。
+
 ## [0.0.2] - 2026-06-16
 
 ### 新增
@@ -51,6 +60,7 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/releases/tag/v0.0.1

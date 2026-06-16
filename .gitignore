@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 *.log
 .claude/settings.local.json
+.inbox/
+# 测试用的个人证件等本地资料，勿上库
+营业执照.png

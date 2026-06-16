@@ -10,6 +10,8 @@ feishu_claude_bridge.py
   - 自动连接飞书并自动重连
   - 私聊(P2P)：直接回复
   - 群聊：仅当 @ 机器人时回复（避免刷屏）
+  - 收文本/图片/文件/富文本(post)：图片与文件自动下载到本地交给 claude 查看处理
+  - 发图片：回复里写 <<<IMG>>>路径 或 ![](本地路径)，自动上传成飞书图片消息
   - 每个会话（私聊=每人 / 群=每群）首条自动新建 session，之后自动续接
   - 持久化 session：chat 映射落盘 + claude 会话 --resume，重启不丢上下文
   - 多 session 并行隔离：不同会话独立进程；同会话加锁串行
@@ -41,7 +43,7 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 # ---------- 配置 ----------
 # 所有可变项集中在脚本同目录的 config.json（不入库，见 README「配置」）。
@@ -70,6 +72,10 @@ WORKDIR = _conf.get("workdir") or BASE_DIR
 # session 持久化目录
 STATE_DIR = _conf.get("state_dir") or os.path.expanduser("~/.feishu_bridge")
 SESSIONS_FILE = os.path.join(STATE_DIR, "sessions.json")
+# 用户发来的图片/文件下载到这里，处理完即删。
+# 放在 WORKDIR 下（而非 STATE_DIR）：claude -p 以 WORKDIR 为工作目录，
+# 沙箱通常只允许读工作目录内的文件，放这里才能被 Read 工具读到。
+INBOX_DIR = os.path.join(WORKDIR, ".inbox")
 CLAUDE_TIMEOUT = int(_conf.get("timeout", 600))
 # 会话作用域：
 #   chat_user(默认) 群里按“群+人”分 session：同群不同人各自独立、并行执行
@@ -84,6 +90,7 @@ _tools = _conf.get("allowed_tools",
 ALLOWED_TOOLS = _tools.split() if isinstance(_tools, str) else list(_tools)
 RESET_CMDS = {"/new", "/reset", "/新会话", "新会话", "重置会话"}
 os.makedirs(STATE_DIR, exist_ok=True)
+os.makedirs(INBOX_DIR, exist_ok=True)
 
 # 群白名单：config.json 的 allowed_chats(数组)；空/缺省=对所有会话响应
 _allow = _conf.get("allowed_chats")
@@ -457,6 +464,80 @@ def _bot_mentioned(msg) -> bool:
     return False
 
 
+_IMG_EXT_BY_CTYPE = {
+    "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+    "image/webp": ".webp", "image/bmp": ".bmp",
+}
+
+
+def _download_resource(message_id: str, file_key: str, rtype: str, name: str = "") -> str | None:
+    """下载消息里的图片/文件资源到 INBOX_DIR，返回本地路径；失败返回 None。
+    rtype: 'image'（图片）| 'file'（文件）。"""
+    try:
+        token = _get_tenant_token()
+        url = (f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}"
+               f"/resources/{file_key}?type={rtype}")
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+        safe = os.path.basename(name or file_key)  # 防目录穿越
+        if "." not in safe:  # 没扩展名（多为图片）→ 按 Content-Type 补一个
+            safe += _IMG_EXT_BY_CTYPE.get(ctype, ".png" if rtype == "image" else ".bin")
+        path = os.path.join(INBOX_DIR, f"{message_id}_{safe}")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+    except Exception as e:  # noqa: BLE001
+        print(f"[resource download error] {e} key={file_key} type={rtype}")
+        return None
+
+
+def _parse_message(msg) -> tuple[str | None, list[dict]]:
+    """把消息解析成 (文字, 附件列表)；附件为 {file_key,type,name}。
+    支持 text / image / file / post（富文本）；不支持的类型返回 (None, [])。"""
+    try:
+        content = json.loads(msg.content)
+    except Exception:  # noqa: BLE001
+        return None, []
+    mtype = msg.message_type
+    if mtype == "text":
+        return _MENTION_RE.sub("", content.get("text", "")).strip(), []
+    if mtype == "image":
+        key = content.get("image_key")
+        return "", [{"file_key": key, "type": "image", "name": ""}] if key else []
+    if mtype == "file":
+        key = content.get("file_key")
+        return "", [{"file_key": key, "type": "file", "name": content.get("file_name", "")}] if key else []
+    if mtype == "post":
+        texts: list[str] = []
+        atts: list[dict] = []
+        if content.get("title"):
+            texts.append(content["title"])
+        for line in content.get("content", []) or []:
+            for seg in line or []:
+                tag = seg.get("tag")
+                if tag in ("text", "a"):
+                    texts.append(seg.get("text", ""))
+                elif tag == "img" and seg.get("image_key"):
+                    atts.append({"file_key": seg["image_key"], "type": "image", "name": ""})
+                elif tag == "media" and seg.get("file_key"):
+                    atts.append({"file_key": seg["file_key"], "type": "file", "name": seg.get("file_name", "")})
+        caption = _MENTION_RE.sub("", " ".join(t for t in texts if t)).strip()
+        return caption, atts
+    return None, []  # audio / sticker / 其它：暂不支持
+
+
+def _build_media_prompt(caption: str, paths: list[str]) -> str:
+    """把下载好的本地文件路径拼进给 claude 的提示词。"""
+    listing = "\n".join(f"- {p}" for p in paths)
+    head = ("用户发来以下本地文件（已下载到本机，可用 Read 等工具查看后处理）：\n"
+            f"{listing}")
+    if caption:
+        return f"{head}\n\n用户附言：{caption}"
+    return head + "\n\n用户没有附文字说明，请先解析/描述这些文件的内容，再等待进一步指示。"
+
+
 def on_message(data: P2ImMessageReceiveV1) -> None:
     msg = data.event.message
     chat_id = msg.chat_id
@@ -464,17 +545,14 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     chat_type = getattr(msg, "chat_type", "")  # p2p | group
     if ALLOWED_CHATS is not None and chat_id not in ALLOWED_CHATS:
         return
-    if msg.message_type != "text":
-        return
     # 群聊：仅 @ 机器人才响应；私聊：始终响应
     if chat_type == "group" and not _bot_mentioned(msg):
         return
-    try:
-        text = json.loads(msg.content).get("text", "")
-    except Exception:  # noqa: BLE001
+    caption, attachments = _parse_message(msg)
+    if caption is None:  # 不支持的消息类型
         return
-    text = _MENTION_RE.sub("", text).strip()
-    if not text:
+    text = caption
+    if not text and not attachments:  # 空消息
         return
 
     # 启动闸门：丢弃“桥启动之前产生”的消息。
@@ -484,7 +562,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     except (TypeError, ValueError):
         create_ms = 0.0
     if create_ms and create_ms < START_TIME_MS:
-        print(f"[skip stale] chat={chat_id} create={create_ms:.0f} < start={START_TIME_MS:.0f} | {text[:40]}")
+        print(f"[skip stale] chat={chat_id} create={create_ms:.0f} < start={START_TIME_MS:.0f} | {(text or '[媒体]')[:40]}")
         return
 
     # 消息去重：同一 message_id 在 TTL 内只处理一次
@@ -501,27 +579,45 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     else:  # chat_user：群+人；私聊里同一人始终一致
         key = "c:" + chat_id + ":u:" + uid
 
-    # 命令：开启新 session
-    if text in RESET_CMDS:
+    # 命令：开启新 session（仅纯文本命令、无附件时）
+    if text in RESET_CMDS and not attachments:
         _reset_session(key)
         reply_to(message_id, chat_id, "🆕 已开启新会话，之前上下文已清空。")
         return
 
     where = "群聊" if chat_type == "group" else "私聊"
-    print(f"\n[{_ts()}] 📩 飞书（{where}）收到: {text}")
+    desc = text or f"[{len(attachments)} 个附件]"
+    print(f"\n[{_ts()}] 📩 飞书（{where}）收到: {desc}")
 
     # chat_id / message_id 用默认参数绑定，杜绝闭包串扰
     # 直接喂用户原文：不告诉 Claude 它在飞书、不给 chat_id，它就不会想着自己发消息
-    def worker(_key=key, _chat=chat_id, _mid=message_id, _text=text, _type=chat_type):
+    def worker(_key=key, _chat=chat_id, _mid=message_id, _text=text, _type=chat_type,
+               _atts=attachments):
         print(f"[{_ts()}] 🤔 Claude 处理中……", flush=True)
         t0 = time.monotonic()
         reaction_id = _add_reaction(_mid)  # ⌨️ 正在输入中…
-        with _key_lock(_key):  # 同会话串行；不同会话并行隔离
-            reply = ask_claude(_key, _text, _chat, _type)
-        if reaction_id:
-            _del_reaction(_mid, reaction_id)
-        reply_to(_mid, _chat, reply)
-        print(f"[{_ts()}] 💬 Claude 回复（耗时 {time.monotonic() - t0:.0f}s）:\n{reply}\n")
+        # 下载附件（图片/文件）到本地，把路径拼进提示词
+        paths: list[str] = []
+        for att in _atts:
+            p = _download_resource(_mid, att["file_key"], att["type"], att.get("name", ""))
+            if p:
+                paths.append(p)
+        prompt = _build_media_prompt(_text, paths) if paths else _text
+        if not prompt:  # 附件全部下载失败、又无文字
+            prompt = "用户发来了附件但下载失败，请告知用户重发或换种方式。"
+        try:
+            with _key_lock(_key):  # 同会话串行；不同会话并行隔离
+                reply = ask_claude(_key, prompt, _chat, _type)
+            if reaction_id:
+                _del_reaction(_mid, reaction_id)
+            reply_to(_mid, _chat, reply)
+            print(f"[{_ts()}] 💬 Claude 回复（耗时 {time.monotonic() - t0:.0f}s）:\n{reply}\n")
+        finally:
+            for p in paths:  # 处理完清理下载的临时文件
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     threading.Thread(target=worker, daemon=True).start()
 
