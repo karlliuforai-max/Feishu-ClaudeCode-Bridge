@@ -21,6 +21,7 @@ feishu_claude_bridge.py
   必填: app_id, app_secret
   可选: model(默认 claude-opus-4-8) / workdir / state_dir / timeout /
         max_attachment_bytes / stream_terminal / terminal_stream_format /
+        stream_reply / stream_reply_interval /
         session_scope(chat_user|chat|user) / allowed_tools / allowed_chats
   可用环境变量 BRIDGE_CONFIG 指定其它配置文件路径。
 """
@@ -46,7 +47,7 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 # 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
 START_TIME_MS = time.time() * 1000
 
@@ -108,6 +109,12 @@ STREAM_TERMINAL = _as_bool(_conf.get("stream_terminal"), True)
 TERMINAL_STREAM_FORMAT = str(_conf.get("terminal_stream_format", "text")).strip().lower()
 if TERMINAL_STREAM_FORMAT not in {"text", "json"}:
     raise SystemExit("❌ 配置错误: terminal_stream_format 只能是 text 或 json")
+# 流式回复：开启后用飞书 CardKit 流式卡片「边生成边更新」，让用户实时看到 Claude 打字。
+# 默认关闭：保留稳妥的「生成完一次性回复」路径作为兜底，任一环节失败都会自动退回普通回复。
+# 开启时会强制使用 stream-json 以获取增量文本（与 terminal_stream_format 无关）。
+STREAM_REPLY = _as_bool(_conf.get("stream_reply"), False)
+# 卡片最小刷新间隔（秒）。飞书 CardKit 文本更新限频 50 次/秒、1000 次/分，默认 0.7s 足够稳。
+STREAM_REPLY_INTERVAL = float(_conf.get("stream_reply_interval", 0.7))
 # 会话作用域：
 #   chat_user(默认) 群里按“群+人”分 session：同群不同人各自独立、并行执行
 #   chat            整个群共用一个 session（群内串行、共享上下文）
@@ -417,78 +424,208 @@ def _extract_text_from_content(content) -> str:
     return "".join(parts)
 
 
-def _handle_stream_json_line(line: str) -> tuple[str, str, bool]:
-    """返回 (终端展示文本, 可作为最终回复候选的文本片段, 是否最终 result)。"""
-    raw = line.strip()
-    if not raw:
-        return "", "", False
-    try:
-        event = json.loads(raw)
-    except json.JSONDecodeError:
-        return f"[claude:raw] {raw}\n", raw + "\n", False
-    if not isinstance(event, dict):
-        return f"[claude:event] {_short_json(event)}\n", "", False
+def _truncate(value, limit: int = 200) -> str:
+    s = value if isinstance(value, str) else str(value)
+    s = s.replace("\n", " ").strip()
+    return s if len(s) <= limit else s[:limit] + "…"
 
-    etype = str(event.get("type") or event.get("event") or "event")
-    subtype = event.get("subtype")
 
-    if etype == "system":
-        model = event.get("model") or event.get("message", {}).get("model", "")
-        sid = event.get("session_id") or event.get("sessionId") or ""
-        detail = " ".join(p for p in [f"subtype={subtype}" if subtype else "", f"model={model}" if model else "", f"session={sid}" if sid else ""] if p)
-        return f"[claude:system] {detail or _short_json(event)}\n", "", False
+# 常见工具 → 最能说明「这步在干嘛」的输入字段。其余工具回退到压缩后的 JSON。
+_TOOL_SUMMARY_KEY = {
+    "Read": "file_path", "Write": "file_path", "Edit": "file_path",
+    "MultiEdit": "file_path", "NotebookEdit": "notebook_path",
+    "Bash": "command", "Grep": "pattern", "Glob": "pattern",
+    "Task": "description",
+}
 
-    if etype == "assistant":
+
+def _summarize_tool(name: str, tool_input) -> str:
+    """把一次工具调用压成一行人能看懂的摘要：Read 显示文件、Bash 显示命令等。"""
+    i = tool_input if isinstance(tool_input, dict) else {}
+    key = _TOOL_SUMMARY_KEY.get(name)
+    if key and i.get(key):
+        return _truncate(i[key])
+    if name in {"WebFetch", "WebSearch"}:
+        return _truncate(i.get("url") or i.get("query") or "")
+    if name == "Skill":
+        return _truncate(i.get("command") or i.get("skill") or "")
+    if name == "TodoWrite":
+        todos = i.get("todos")
+        return f"{len(todos)} 项待办" if isinstance(todos, list) else ""
+    return _truncate(_short_json(i, 200))
+
+
+def _collapse(text: str, max_lines: int = 4, max_chars: int = 500) -> str:
+    """长工具结果折叠：只留前几行/若干字符，带「│」缩进前缀，超出给出统计提示。"""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    full_len = len(text)
+    lines = text.splitlines()
+    clipped = len(lines) > max_lines
+    lines = lines[:max_lines]
+    body = "\n".join(lines)
+    if len(body) > max_chars:
+        body = body[:max_chars]
+        clipped = True
+    out = "\n".join("    │ " + ln for ln in body.splitlines())
+    if clipped:
+        out += f"\n    │ …（共 {full_len} 字，已折叠）"
+    return out
+
+
+class _StreamJsonRenderer:
+    """消费 claude `--output-format stream-json` 的事件流。
+
+    职责：
+      1) 把事件渲染成统一时间线打到终端（system / 工具调用 / 工具结果 / 文本 / result）；
+      2) 实时把助手文本增量通过 on_text_delta 回调出去（供流式卡片）；
+      3) 汇总最终回复文本（final_text，以 result 事件为准，缺失时回退增量/整段）。
+    """
+
+    def __init__(self, tag: str = "", echo: bool = True, on_text_delta=None):
+        self.tag = tag
+        self.echo = echo
+        self.on_text_delta = on_text_delta
+        self.tools: dict[str, dict] = {}     # tool_use_id -> {name, summary, t0}
+        self.final_result = ""
+        self.delta_parts: list[str] = []
+        self.assistant_parts: list[str] = []
+        self.had_delta = False               # 当前助手轮是否已经流过增量，避免整段重复
+        self.error = False
+
+    # ---- 终端输出小工具 ----
+    def _prefix(self) -> str:
+        return f"[{self.tag}] " if self.tag else ""
+
+    def _line(self, text: str) -> None:
+        if self.echo:
+            print(self._prefix() + text, flush=True)
+
+    def _raw(self, text: str) -> None:
+        if self.echo:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+    def _push_text(self, text: str) -> None:
+        if not text:
+            return
+        if self.on_text_delta:
+            try:
+                self.on_text_delta(text)
+            except Exception as e:  # noqa: BLE001
+                print(f"[stream-reply error] {e}")
+
+    # ---- 事件分发 ----
+    def feed(self, line: str) -> None:
+        raw = line.strip()
+        if not raw:
+            return
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            self._line(f"[raw] {_truncate(raw, 300)}")
+            return
+        if not isinstance(event, dict):
+            return
+        etype = str(event.get("type") or event.get("event") or "event")
+        if etype == "stream_event":  # --include-partial-messages 包了一层
+            self._on_partial(event.get("event"))
+            return
+        handler = getattr(self, f"_on_{etype}", None)
+        if handler:
+            handler(event)
+        elif etype in {"content_block_delta", "message_delta"}:
+            self._on_partial(event)
+        else:
+            self._line(f"[{etype}] {_short_json(event, 200)}")
+
+    def _on_partial(self, ev) -> None:
+        if not isinstance(ev, dict):
+            return
+        if ev.get("type") == "content_block_delta":
+            delta = ev.get("delta") or {}
+            text = delta.get("text") or ""   # thinking_delta 没有 text 字段，天然跳过
+            if text:
+                self.had_delta = True
+                self.delta_parts.append(text)
+                self._raw(text)
+                self._push_text(text)
+
+    def _on_system(self, event) -> None:
+        sub = event.get("subtype")
+        model = event.get("model") or ""
+        bits = [b for b in [f"subtype={sub}" if sub else "", f"model={model}" if model else ""] if b]
+        self._line("[system] " + (" ".join(bits) or _short_json(event, 200)))
+
+    def _on_assistant(self, event) -> None:
         message = event.get("message") if isinstance(event.get("message"), dict) else event
         content = message.get("content")
-        text = _extract_text_from_content(content)
-        tool_lines: list[str] = []
         if isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "tool_use":
+                    tid = item.get("id") or ""
                     name = item.get("name") or item.get("tool_name") or "tool"
-                    tool_input = item.get("input", {})
-                    tool_lines.append(f"[claude:tool] {name} input={_short_json(tool_input)}")
-        terminal = ("\n".join(tool_lines) + ("\n" if tool_lines else ""))
+                    summary = _summarize_tool(name, item.get("input"))
+                    self.tools[tid] = {"name": name, "summary": summary, "t0": time.monotonic()}
+                    self._line(f"[tool ▶] {name}  {summary}".rstrip())
+        text = _extract_text_from_content(content)
         if text:
-            terminal += text
-            if not terminal.endswith("\n"):
-                terminal += "\n"
-        return terminal, text, False
+            self.assistant_parts.append(text)
+            if not self.had_delta:  # 没有增量流（理论上不会，但兜底）→ 整段打印+推送一次
+                self._raw(text + ("" if text.endswith("\n") else "\n"))
+                self._push_text(text)
+        self.had_delta = False  # 该助手块结束，下一块重新计
 
-    if etype in {"content_block_delta", "message_delta"}:
-        delta = event.get("delta")
-        text = delta.get("text") if isinstance(delta, dict) else ""
-        return (text or ""), (text or ""), False
-
-    if etype == "user":
+    def _on_user(self, event) -> None:
         message = event.get("message") if isinstance(event.get("message"), dict) else event
         content = message.get("content")
-        terminal = _extract_text_from_content(content)
-        return (f"[claude:user] {terminal}\n" if terminal else ""), "", False
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "tool_result":
+                    self._render_tool_result(item)
 
-    if etype in {"tool_result", "hook", "hook_event"}:
-        return f"[claude:{etype}] {_short_json(event)}\n", "", False
+    def _render_tool_result(self, item: dict) -> None:
+        tid = item.get("tool_use_id") or ""
+        info = self.tools.pop(tid, None)
+        name = info["name"] if info else "tool"
+        dur = f" {time.monotonic() - info['t0']:.1f}s" if info and info.get("t0") else ""
+        is_err = bool(item.get("is_error"))
+        head = f"[tool {'✗' if is_err else '✓'}{dur}] {name}"
+        self._line(("⚠️ " + head) if is_err else head)
+        body = _collapse(_extract_text_from_content(item.get("content")))
+        if body and self.echo:
+            print(body, flush=True)
+        if is_err:
+            self.error = True
 
-    if etype == "result":
-        result = event.get("result")
-        duration = event.get("duration_ms")
+    def _on_result(self, event) -> None:
+        sub = event.get("subtype")
+        dur = event.get("duration_ms")
         cost = event.get("total_cost_usd")
-        meta = " ".join(
-            p for p in [
-                f"subtype={subtype}" if subtype else "",
-                f"duration_ms={duration}" if duration is not None else "",
-                f"cost_usd={cost}" if cost is not None else "",
-            ] if p
-        )
-        terminal = f"[claude:result] {meta or _short_json(event)}\n"
-        return terminal, result if isinstance(result, str) else "", True
+        res = event.get("result")
+        if isinstance(res, str):
+            self.final_result = res
+        if sub and sub != "success":
+            self.error = True
+        bits = [b for b in [
+            f"subtype={sub}" if sub else "",
+            f"{dur}ms" if dur is not None else "",
+            f"${cost}" if cost is not None else "",
+        ] if b]
+        mark = "⚠️ " if self.error else ""
+        self._line(f"\n{mark}[result] " + " ".join(bits))
 
-    return f"[claude:{etype}] {_short_json(event)}\n", "", False
+    @property
+    def final_text(self) -> str:
+        return (self.final_result or "".join(self.delta_parts)
+                or "".join(self.assistant_parts)).strip()
 
 
-def _run_claude_streaming(cmd: list[str], stream_format: str) -> str:
-    print(f"[{_ts()}] ▶ Claude 终端流开始（format={stream_format}，飞书仅发送最终结果）", flush=True)
+def _run_claude_streaming(cmd: list[str], stream_format: str, tag: str = "",
+                          text_delta_cb=None, terminal_echo: bool = True) -> str:
+    if terminal_echo:
+        print(f"[{_ts()}] ▶ Claude 流开始 [{tag}]（format={stream_format}）", flush=True)
     by_line = stream_format == "json"
     proc = subprocess.Popen(
         cmd,
@@ -506,10 +643,10 @@ def _run_claude_streaming(cmd: list[str], stream_format: str) -> str:
     for t in threads:
         t.start()
 
+    renderer = (_StreamJsonRenderer(tag=tag, echo=terminal_echo, on_text_delta=text_delta_cb)
+                if stream_format == "json" else None)
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
-    final_candidates: list[str] = []
-    result_text = ""
     deadline = time.monotonic() + CLAUDE_TIMEOUT
     timed_out = False
 
@@ -522,20 +659,20 @@ def _run_claude_streaming(cmd: list[str], stream_format: str) -> str:
         if chunk:
             if stream_name == "stderr":
                 stderr_chunks.append(chunk)
-                sys.stderr.write(chunk)
-                sys.stderr.flush()
-            elif stream_format == "json":
-                terminal, final_piece, is_result = _handle_stream_json_line(chunk)
-                if terminal:
-                    print(terminal, end="", flush=True)
-                if final_piece:
-                    if is_result:
-                        result_text = final_piece
-                    else:
-                        final_candidates.append(final_piece)
+                if terminal_echo:
+                    sys.stderr.write(chunk)
+                    sys.stderr.flush()
+            elif renderer is not None:
+                renderer.feed(chunk)
             else:
                 stdout_chunks.append(chunk)
-                print(chunk, end="", flush=True)
+                if terminal_echo:
+                    print(chunk, end="", flush=True)
+                if text_delta_cb:  # text 档也支持流式回复：逐块推送
+                    try:
+                        text_delta_cb(chunk)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[stream-reply error] {e}")
 
         if proc.poll() is not None and out_q.empty() and all(not t.is_alive() for t in threads):
             break
@@ -550,21 +687,26 @@ def _run_claude_streaming(cmd: list[str], stream_format: str) -> str:
     if timed_out:
         raise subprocess.TimeoutExpired(cmd, CLAUDE_TIMEOUT)
 
-    print(f"\n[{_ts()}] ■ Claude 终端流结束", flush=True)
-    if stream_format == "json":
-        out = (result_text or "".join(final_candidates)).strip()
-    else:
-        out = "".join(stdout_chunks).strip()
+    if terminal_echo:
+        print(f"\n[{_ts()}] ■ Claude 流结束 [{tag}]", flush=True)
+    out = renderer.final_text if renderer is not None else "".join(stdout_chunks).strip()
     return out or _fallback_no_output("".join(stderr_chunks))
 
 
-def ask_claude(key: str, text: str, chat_id: str = "", chat_type: str = "") -> str:
+def ask_claude(key: str, text: str, chat_id: str = "", chat_type: str = "",
+               text_delta_cb=None) -> str:
     sid, is_new = _get_or_create_sid(key, chat_id, chat_type)
-    output_format = "stream-json" if STREAM_TERMINAL and TERMINAL_STREAM_FORMAT == "json" else "text"
+    # 终端 json 档 或 流式回复 都需要 stream-json（前者要结构化事件，后者要增量文本）
+    want_json = (STREAM_TERMINAL and TERMINAL_STREAM_FORMAT == "json") or (text_delta_cb is not None)
+    output_format = "stream-json" if want_json else "text"
     cmd = _build_claude_cmd(text, sid, is_new, output_format)
+    tag = sid[:8]
     try:
-        if STREAM_TERMINAL:
-            return _run_claude_streaming(cmd, TERMINAL_STREAM_FORMAT)
+        if STREAM_TERMINAL or text_delta_cb:
+            return _run_claude_streaming(
+                cmd, "json" if want_json else "text",
+                tag=tag, text_delta_cb=text_delta_cb, terminal_echo=STREAM_TERMINAL,
+            )
         return _run_claude_buffered(cmd)
     except subprocess.TimeoutExpired:
         return "⌛ 处理超时了，换个更具体的问题再试。"
@@ -712,6 +854,151 @@ def reply_to(message_id: str, chat_id: str, text: str) -> None:
         if not resp.success():
             print(f"[reply fail] code={resp.code} msg={resp.msg} -> 兜底直发 {chat_id}")
             _send_part(chat_id, msg_type, content)
+
+
+# ---------- 流式回复：飞书 CardKit 流式卡片 ----------
+# 思路：先创建一张「streaming_mode」卡片实体，回复用户消息把它发出去；随后随着 Claude
+# 产出增量文本，按 PUT 全量文本 + 递增 sequence 更新卡片，飞书端做打字机渲染；结束时
+# 写入最终（去掉本地图片引用的）文本并关闭流式，再把本地图片作为独立消息补发。
+# 任何一步失败都 fail-soft：CardStreamer.finish 返回 False，调用方退回普通 reply_to。
+_CARDKIT_BASE = "https://open.feishu.cn/open-apis/cardkit/v1/cards"
+
+
+def _cardkit_request(url: str, payload: dict, method: str = "POST") -> dict | None:
+    try:
+        token = _get_tenant_token()
+        req = urllib.request.Request(
+            url, data=json.dumps(payload, ensure_ascii=False).encode(), method=method,
+            headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+        )
+        data = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        if data.get("code") == 0:
+            return data
+        print(f"[cardkit {method} fail] code={data.get('code')} msg={data.get('msg')} url={url}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[cardkit {method} error] {e} url={url}")
+    return None
+
+
+def _streaming_card_json(initial: str = "⌛ 正在生成…") -> str:
+    card = {
+        "schema": "2.0",
+        "config": {
+            "width_mode": "fill",
+            "streaming_mode": True,
+            "streaming_config": {
+                "print_frequency_ms": {"default": 30},
+                "print_step": {"default": 2},
+                "print_strategy": "fast",
+            },
+        },
+        "body": {"elements": [
+            {"tag": "markdown", "content": initial, "element_id": CardStreamer.ELEMENT_ID},
+        ]},
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
+def _reply_card(message_id: str, card_id: str) -> bool:
+    """以「回复原消息」的方式把卡片实体发出去，确保落在来源会话。"""
+    content = json.dumps({"type": "card", "data": {"card_id": card_id}})
+    try:
+        body = ReplyMessageRequestBody.builder().msg_type("interactive").content(content).build()
+        req = ReplyMessageRequest.builder().message_id(message_id).request_body(body).build()
+        resp = client.im.v1.message.reply(req)
+        if resp.success():
+            return True
+        print(f"[reply card fail] code={resp.code} msg={resp.msg}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[reply card error] {e}")
+    return False
+
+
+class CardStreamer:
+    """把 Claude 的增量文本流式更新到一张飞书卡片上。线程内串行使用（同会话 worker）。"""
+
+    ELEMENT_ID = "bridge_md"
+
+    def __init__(self, message_id: str, chat_id: str, interval: float = 0.7):
+        self.message_id = message_id
+        self.chat_id = chat_id
+        self.interval = max(0.2, interval)
+        self.card_id: str | None = None
+        self.failed = False
+        self.buf = ""
+        self.seq = 0
+        self.last_push = 0.0
+        self.lock = threading.Lock()
+
+    def _next_seq(self) -> int:
+        self.seq += 1
+        return self.seq
+
+    def _ensure_card(self) -> bool:
+        """懒创建卡片并发出。任一步失败标记 failed，后续直接放弃流式。"""
+        if self.card_id:
+            return True
+        if self.failed:
+            return False
+        data = _cardkit_request(_CARDKIT_BASE, {"type": "card_json", "data": _streaming_card_json()})
+        card_id = (data or {}).get("data", {}).get("card_id")
+        if not card_id or not _reply_card(self.message_id, card_id):
+            self.failed = True
+            return False
+        self.card_id = card_id
+        return True
+
+    def _update(self, content: str) -> bool:
+        url = f"{_CARDKIT_BASE}/{self.card_id}/elements/{self.ELEMENT_ID}/content"
+        ok = _cardkit_request(
+            url, {"content": content, "sequence": self._next_seq(), "uuid": uuid.uuid4().hex},
+            method="PUT",
+        )
+        return ok is not None
+
+    def push(self, delta: str) -> None:
+        """收到增量文本：累积，按最小间隔限频地把全量文本刷到卡片。"""
+        with self.lock:
+            if self.failed:
+                return
+            self.buf += delta
+            now = time.monotonic()
+            if now - self.last_push < self.interval:
+                return
+            if not self._ensure_card():
+                return
+            if self._update(self.buf):
+                self.last_push = now
+
+    def finish(self, final_text: str) -> bool:
+        """收尾。返回 True=已通过卡片完成发送；False=请调用方退回普通 reply_to。"""
+        with self.lock:
+            text = (final_text or "").strip()
+            # 自定义卡片（<<<CARD>>>）无法塞进流式 markdown：收掉占位卡片，交还普通通道透传
+            if text.startswith(_CARD_MARKER):
+                if self.card_id:
+                    self._update("（见下方卡片）")
+                    _cardkit_request(f"{_CARDKIT_BASE}/{self.card_id}/settings",
+                                     {"settings": json.dumps({"config": {"streaming_mode": False}}),
+                                      "sequence": self._next_seq(), "uuid": uuid.uuid4().hex},
+                                     method="PATCH")
+                return False
+            cleaned, img_paths = _extract_images(text)
+            if not self._ensure_card():  # 整段未能建卡 → 退回普通回复
+                return False
+            self._update(cleaned or "(无文本输出)")
+            _cardkit_request(f"{_CARDKIT_BASE}/{self.card_id}/settings",
+                             {"settings": json.dumps({"config": {"streaming_mode": False}}),
+                              "sequence": self._next_seq(), "uuid": uuid.uuid4().hex},
+                             method="PATCH")
+            # 本地图片仍走独立 image 消息（卡片里渲染不了本地路径）
+            for p in img_paths:
+                key = _upload_image(p)
+                if key:
+                    _send_part(self.chat_id, "image", json.dumps({"image_key": key}))
+                else:
+                    _send_part(self.chat_id, "interactive", _md_card(f"(图片发送失败，本地路径：{p})"))
+            return True
 
 
 def _bot_mentioned(msg) -> bool:
@@ -898,12 +1185,16 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         prompt = _build_media_prompt(_text, paths) if paths else _text
         if not prompt:  # 附件全部下载失败、又无文字
             prompt = "用户发来了附件但下载失败，请告知用户重发或换种方式。"
+        # 流式回复：边生成边更新卡片；任一环节失败 finish() 返回 False，退回普通 reply_to
+        streamer = CardStreamer(_mid, _chat, STREAM_REPLY_INTERVAL) if STREAM_REPLY else None
+        delta_cb = streamer.push if streamer else None
         try:
             with _key_lock(_key):  # 同会话串行；不同会话并行隔离
-                reply = ask_claude(_key, prompt, _chat, _type)
+                reply = ask_claude(_key, prompt, _chat, _type, text_delta_cb=delta_cb)
             if reaction_id:
                 _del_reaction(_mid, reaction_id)
-            reply_to(_mid, _chat, reply)
+            if not (streamer and streamer.finish(reply)):
+                reply_to(_mid, _chat, reply)
             print(f"[{_ts()}] 💬 Claude 回复（耗时 {time.monotonic() - t0:.0f}s）:\n{reply}\n")
         finally:
             for p in paths:  # 处理完清理下载的临时文件

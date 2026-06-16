@@ -175,31 +175,72 @@ class BridgeCoreTests(unittest.TestCase):
         self.assertIn("--include-partial-messages", cmd)
         self.assertIn("--include-hook-events", cmd)
 
-    def test_stream_json_handler_extracts_terminal_events_and_final_result(self):
-        tool_line, tool_piece, is_result = self.bridge._handle_stream_json_line(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "message": {
-                        "content": [
-                            {"type": "tool_use", "name": "Read", "input": {"file_path": "a.txt"}},
-                            {"type": "text", "text": "partial"},
-                        ]
-                    },
-                }
-            )
-        )
-        self.assertIn("[claude:tool] Read", tool_line)
-        self.assertIn("partial", tool_line)
-        self.assertEqual(tool_piece, "partial")
-        self.assertFalse(is_result)
+    def test_summarize_tool_picks_friendly_field(self):
+        s = self.bridge._summarize_tool
+        self.assertEqual(s("Read", {"file_path": "a.txt"}), "a.txt")
+        self.assertEqual(s("Bash", {"command": "ls -la"}), "ls -la")
+        self.assertEqual(s("WebFetch", {"url": "https://x.dev"}), "https://x.dev")
+        self.assertEqual(s("WebSearch", {"query": "feishu"}), "feishu")
+        self.assertEqual(s("TodoWrite", {"todos": [1, 2, 3]}), "3 项待办")
 
-        result_line, result_piece, is_result = self.bridge._handle_stream_json_line(
-            json.dumps({"type": "result", "subtype": "success", "result": "final answer"})
-        )
-        self.assertIn("[claude:result]", result_line)
-        self.assertEqual(result_piece, "final answer")
-        self.assertTrue(is_result)
+    def test_collapse_folds_long_results(self):
+        long = "\n".join(f"line{i}" for i in range(20))
+        out = self.bridge._collapse(long, max_lines=3)
+        self.assertEqual(out.count("│ line"), 3)
+        self.assertIn("已折叠", out)
+        self.assertEqual(self.bridge._collapse("short"), "    │ short")
+        self.assertEqual(self.bridge._collapse(""), "")
+
+    def test_stream_json_renderer_pairs_tools_and_streams_text(self):
+        deltas = []
+        r = self.bridge._StreamJsonRenderer(echo=False, on_text_delta=deltas.append)
+        # 助手发起工具调用
+        r.feed(json.dumps({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "a.txt"}},
+            ]},
+        }))
+        self.assertIn("t1", r.tools)
+        # 工具结果配对，消费掉记录
+        r.feed(json.dumps({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            ]},
+        }))
+        self.assertNotIn("t1", r.tools)
+        # 增量文本通过回调流出
+        r.feed(json.dumps({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hel"}},
+        }))
+        r.feed(json.dumps({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "lo"}},
+        }))
+        self.assertEqual(deltas, ["Hel", "lo"])
+        # result 事件给出权威最终文本
+        r.feed(json.dumps({"type": "result", "subtype": "success", "result": "final answer"}))
+        self.assertEqual(r.final_text, "final answer")
+
+    def test_stream_json_renderer_marks_errors(self):
+        r = self.bridge._StreamJsonRenderer(echo=False)
+        r.feed(json.dumps({"type": "result", "subtype": "error_max_turns", "result": "x"}))
+        self.assertTrue(r.error)
+
+    def test_streaming_card_json_uses_element_id_and_streaming_mode(self):
+        card = json.loads(self.bridge._streaming_card_json("hi"))
+        self.assertTrue(card["config"]["streaming_mode"])
+        el = card["body"]["elements"][0]
+        self.assertEqual(el["element_id"], self.bridge.CardStreamer.ELEMENT_ID)
+        self.assertEqual(el["content"], "hi")
+
+    def test_card_streamer_custom_card_falls_back_to_normal_reply(self):
+        st = self.bridge.CardStreamer("msg/1", "oc_x")
+        st.failed = True  # 模拟卡片通道不可用 / 自定义卡片
+        handled = st.finish(self.bridge._CARD_MARKER + '{"schema":"2.0"}')
+        self.assertFalse(handled)
 
 
 if __name__ == "__main__":
