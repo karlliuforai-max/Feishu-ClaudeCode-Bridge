@@ -9,6 +9,21 @@
 
 - 暂无
 
+## [0.0.2] - 2026-06-16
+
+### 新增
+
+- **图片发送**：回复中夹带本地图片时，桥会先上传到飞书换取 `image_key`，再作为独立 image 消息发出。支持两种写法：整行指令 `<<<IMG>>>路径`，或 Markdown `![](本地路径)`（相对路径相对 `workdir` 解析）。指向网络 URL 的图片原样保留在文本中。
+
+### 修复
+
+- 修复回复中含本地图片 Markdown 时**整条消息发送失败**的问题（飞书报 `card contains invalid image keys`，且兜底直发沿用同样内容一并失败，导致连文字都发不出）。现已将本地图片从文本中摘出、单独上传发送。
+
+### 优化
+
+- `reply_to` 回复失败时改为**只兜底重发当前 part**，不再整段重发，避免重复消息。
+- 图片上传失败时降级为一行文字路径提示，保证其余内容正常送达。
+
 ## [0.0.1] - 2026-06-16
 
 首个可用版本：单文件实现的飞书 ↔ Claude Code 桥。
@@ -36,5 +51,6 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/releases/tag/v0.0.1

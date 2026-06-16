@@ -32,6 +32,8 @@ import uuid
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
+    CreateImageRequest,
+    CreateImageRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
     P2ImMessageReceiveV1,
@@ -39,7 +41,7 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # ---------- 配置 ----------
 # 所有可变项集中在脚本同目录的 config.json（不入库，见 README「配置」）。
@@ -302,15 +304,75 @@ def ask_claude(key: str, text: str, chat_id: str = "", chat_type: str = "") -> s
 
 # ---------- 飞书收发 ----------
 _CARD_MARKER = "<<<CARD>>>"
+_IMG_MARKER = "<<<IMG>>>"
+# 整行图片指令：<<<IMG>>>路径
+_IMG_LINE_RE = re.compile(r"^\s*<<<IMG>>>(.+?)\s*$", re.MULTILINE)
+# markdown 图片：![alt](路径)
+_MD_IMG_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+
+
+def _resolve_local_image(ref: str) -> str | None:
+    """把图片引用解析成存在的本地文件路径；http(s) 链接或不存在则返回 None。"""
+    p = ref.strip().strip('"').strip("'")
+    if not p or p.startswith(("http://", "https://", "data:")):
+        return None
+    if not os.path.isabs(p):
+        p = os.path.join(WORKDIR, p)
+    return p if os.path.isfile(p) else None
+
+
+def _extract_images(text: str) -> tuple[str, list[str]]:
+    """抽出文本里指向本地文件的图片引用（<<<IMG>>>路径 / ![](本地路径)），
+    返回 (移除这些引用后的文本, 本地图片路径列表)。
+    指向网络 URL 的 markdown 图片原样保留（飞书 markdown 能渲染外链图）。"""
+    paths: list[str] = []
+
+    def _sub(m: "re.Match") -> str:
+        local = _resolve_local_image(m.group(1))
+        if local:
+            paths.append(local)
+            return ""  # 从文本里摘掉，改为独立 image 消息发送
+        return m.group(0)
+
+    text = _IMG_LINE_RE.sub(_sub, text)
+    text = _MD_IMG_RE.sub(_sub, text)
+    return text.strip(), paths
+
+
+def _upload_image(path: str) -> str | None:
+    """上传本地图片到飞书，返回 image_key；失败返回 None。"""
+    try:
+        with open(path, "rb") as f:
+            body = CreateImageRequestBody.builder().image_type("message").image(f).build()
+            req = CreateImageRequest.builder().request_body(body).build()
+            resp = client.im.v1.image.create(req)
+        if resp.success() and resp.data and resp.data.image_key:
+            return resp.data.image_key
+        print(f"[image upload fail] code={resp.code} msg={resp.msg} path={path}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[image upload error] {e} path={path}")
+    return None
+
+
+def _md_card(content: str) -> str:
+    """把一段文本包成 schema 2.0 markdown 卡片 JSON。"""
+    card = {
+        "schema": "2.0",
+        "config": {"width_mode": "fill"},
+        "body": {"elements": [{"tag": "markdown", "content": content}]},
+    }
+    return json.dumps(card, ensure_ascii=False)
 
 
 def _iter_parts(text: str):
     """把 Claude 输出拆成 (msg_type, content_json) 序列。
 
-    两种格式：
+    三类格式：
     1. <<<CARD>>> 开头 → Claude 直接给出完整卡片 JSON，bridge 透传，不再包装。
        适用于需要按钮、多列、标题栏等 markdown 无法表达的场景。
-    2. 普通文本 → 按 20000 字符分块，每块包成 schema 2.0 markdown card。
+    2. 文本里夹带本地图片（<<<IMG>>>路径 或 ![](本地路径)）→ 先发文字，再把每张图
+       上传换取 image_key，作为独立 image 消息发出。上传失败则降级为一行文字提示。
+    3. 其余普通文本 → 按 20000 字符分块，每块包成 schema 2.0 markdown card。
     """
     if text.startswith(_CARD_MARKER):
         card_json = text[len(_CARD_MARKER):].strip()
@@ -320,39 +382,54 @@ def _iter_parts(text: str):
             return
         except json.JSONDecodeError as e:
             print(f"[warn] <<<CARD>>> 后 JSON 非法，退回 markdown: {e}")
-    for i in range(0, max(len(text), 1), 20000):
-        part = text[i: i + 20000]
-        card = {
-            "schema": "2.0",
-            "config": {"width_mode": "fill"},
-            "body": {"elements": [{"tag": "markdown", "content": part}]},
-        }
-        yield "interactive", json.dumps(card, ensure_ascii=False)
+
+    text, img_paths = _extract_images(text)
+
+    # 先发文字（去掉图片引用后若仍有内容）
+    if text:
+        for i in range(0, len(text), 20000):
+            yield "interactive", _md_card(text[i: i + 20000])
+
+    # 再发图片：逐张上传换 key，失败降级为文字提示，绝不让整条消息发不出
+    for p in img_paths:
+        key = _upload_image(p)
+        if key:
+            yield "image", json.dumps({"image_key": key})
+        else:
+            yield "interactive", _md_card(f"(图片发送失败，本地路径：{p})")
+
+
+def _send_part(chat_id: str, msg_type: str, content: str) -> bool:
+    """直发单条消息到指定会话。返回是否成功。"""
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(chat_id)
+        .msg_type(msg_type)
+        .content(content)
+        .build()
+    )
+    req = (
+        CreateMessageRequest.builder()
+        .receive_id_type("chat_id")
+        .request_body(body)
+        .build()
+    )
+    resp = client.im.v1.message.create(req)
+    if not resp.success():
+        print(f"[send fail] code={resp.code} msg={resp.msg}")
+        return False
+    return True
 
 
 def send_text(chat_id: str, text: str) -> None:
     """直接发到指定会话（兜底用）。"""
     for msg_type, content in _iter_parts(text):
-        body = (
-            CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
-            .msg_type(msg_type)
-            .content(content)
-            .build()
-        )
-        req = (
-            CreateMessageRequest.builder()
-            .receive_id_type("chat_id")
-            .request_body(body)
-            .build()
-        )
-        resp = client.im.v1.message.create(req)
-        if not resp.success():
-            print(f"[send fail] code={resp.code} msg={resp.msg}")
+        _send_part(chat_id, msg_type, content)
 
 
 def reply_to(message_id: str, chat_id: str, text: str) -> None:
-    """回复原消息：必然落在消息来源的会话，避免群消息回到私聊。失败兜底直发。"""
+    """回复原消息：必然落在消息来源的会话，避免群消息回到私聊。
+    单条 part 回复失败时只兜底直发该 part（而非整段重发，避免重复）。"""
     for msg_type, content in _iter_parts(text):
         body = (
             ReplyMessageRequestBody.builder()
@@ -364,7 +441,7 @@ def reply_to(message_id: str, chat_id: str, text: str) -> None:
         resp = client.im.v1.message.reply(req)
         if not resp.success():
             print(f"[reply fail] code={resp.code} msg={resp.msg} -> 兜底直发 {chat_id}")
-            send_text(chat_id, text)
+            _send_part(chat_id, msg_type, content)
 
 
 def _bot_mentioned(msg) -> bool:
