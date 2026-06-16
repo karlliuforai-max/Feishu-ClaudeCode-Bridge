@@ -39,6 +39,8 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
+__version__ = "0.0.1"
+
 # ---------- 配置 ----------
 # 所有可变项集中在脚本同目录的 config.json（不入库，见 README「配置」）。
 # 只有 app_id / app_secret 必填，其余缺省即可。可用 BRIDGE_CONFIG 指定别的路径。
@@ -124,6 +126,11 @@ _DEDUP_TTL = 30  # 秒
 START_TIME_MS = time.time() * 1000
 
 
+def _ts() -> str:
+    """本地时间 HH:MM:SS，用于终端对话日志。"""
+    return time.strftime("%H:%M:%S")
+
+
 def _seen_recently(message_id: str) -> bool:
     """同一 message_id 在 TTL 内只处理一次（按时间过期）。"""
     now = time.monotonic()
@@ -138,7 +145,8 @@ def _seen_recently(message_id: str) -> bool:
 
 def _load_sessions() -> dict:
     try:
-        return json.load(open(SESSIONS_FILE))
+        with open(SESSIONS_FILE, encoding="utf-8") as f:
+            return json.load(f)
     except Exception:  # noqa: BLE001
         return {}
 
@@ -189,7 +197,7 @@ def _get_or_create_sid(key: str, chat_id: str = "", chat_type: str = "") -> tupl
         }
         SESSIONS[key] = rec
         _save_sessions()
-        print(f"[session new] key={key} type={mark.get('chat_type')} name={mark.get('chat_name', '-')}")
+        print(f"[{_ts()}] 🆕 开启新会话（{mark.get('chat_name') or '私聊'}）")
         return rec["sid"], True
 
 
@@ -422,18 +430,21 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         reply_to(message_id, chat_id, "🆕 已开启新会话，之前上下文已清空。")
         return
 
-    print(f"[recv] type={chat_type} chat={chat_id} key={key} | {text[:60]}")
+    where = "群聊" if chat_type == "group" else "私聊"
+    print(f"\n[{_ts()}] 📩 飞书（{where}）收到: {text}")
 
     # chat_id / message_id 用默认参数绑定，杜绝闭包串扰
     # 直接喂用户原文：不告诉 Claude 它在飞书、不给 chat_id，它就不会想着自己发消息
     def worker(_key=key, _chat=chat_id, _mid=message_id, _text=text, _type=chat_type):
+        print(f"[{_ts()}] 🤔 Claude 处理中……", flush=True)
+        t0 = time.monotonic()
         reaction_id = _add_reaction(_mid)  # ⌨️ 正在输入中…
         with _key_lock(_key):  # 同会话串行；不同会话并行隔离
             reply = ask_claude(_key, _text, _chat, _type)
         if reaction_id:
             _del_reaction(_mid, reaction_id)
         reply_to(_mid, _chat, reply)
-        print(f"[sent] type={_type} chat={_chat} key={_key} | {reply[:60]}")
+        print(f"[{_ts()}] 💬 Claude 回复（耗时 {time.monotonic() - t0:.0f}s）:\n{reply}\n")
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -453,10 +464,8 @@ if hasattr(_dispatch, "register_p2_im_message_reaction_deleted_v1"):
 handler = _dispatch.build()
 
 if __name__ == "__main__":
-    print("飞书↔Claude 桥启动。大脑=claude -p（无 API key）。")
-    print(f"应用={APP_ID[:10]}…  bot_open_id={BOT_OPEN_ID}")
-    print(f"WORKDIR={WORKDIR}  scope={SESSION_SCOPE}")
-    print(f"session={SESSIONS_FILE}（已载入 {len(SESSIONS)} 个）")
-    print(f"白名单={ALLOWED_CHATS or '开放模式：所有私聊+被@的群都会响应'}")
-    ws = lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.INFO)
+    print(f"✅ 飞书 ↔ Claude 桥 v{__version__} 已就绪，正在连接飞书…… 在飞书里私聊机器人、或群里 @ 它发消息即可。")
+    print("   （下面只显示你的消息、Claude 处理与回复；关闭本窗口即停止服务）\n")
+    # 只显示 WARNING 及以上的 SDK 日志，过滤掉 connected / 心跳等噪音
+    ws = lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.WARNING)
     ws.start()  # 阻塞、自动重连

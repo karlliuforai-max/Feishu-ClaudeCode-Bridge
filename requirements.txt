@@ -1,0 +1,3 @@
+# 唯一第三方依赖：飞书开放平台官方 SDK（消息 encode/decode + WebSocket 长连接）
+# 需 >=1.4：含 lark.ws.Client 长连接与 schema 2.0 卡片支持。
+lark-oapi>=1.4
