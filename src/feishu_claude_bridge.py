@@ -20,14 +20,16 @@ feishu_claude_bridge.py
 配置：默认读项目根目录的 config.json（不入库），字段见 README。
   必填: app_id, app_secret
   可选: model(默认 claude-opus-4-8) / workdir / state_dir / timeout /
-        max_attachment_bytes / session_scope(chat_user|chat|user) /
-        allowed_tools / allowed_chats
+        max_attachment_bytes / stream_terminal / terminal_stream_format /
+        session_scope(chat_user|chat|user) / allowed_tools / allowed_chats
   可用环境变量 BRIDGE_CONFIG 指定其它配置文件路径。
 """
 import json
 import os
+import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -44,7 +46,7 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 # 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
 START_TIME_MS = time.time() * 1000
 
@@ -52,6 +54,18 @@ START_TIME_MS = time.time() * 1000
 def _expand_path(path: str) -> str:
     """展开配置里的 ~ 和环境变量，并转成绝对路径。"""
     return os.path.abspath(os.path.expandvars(os.path.expanduser(str(path))))
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
 
 
 # ---------- 配置 ----------
@@ -90,6 +104,10 @@ CLAUDE_TIMEOUT = int(_conf.get("timeout", 600))
 MAX_ATTACHMENT_BYTES = int(_conf.get("max_attachment_bytes", 25 * 1024 * 1024))
 if MAX_ATTACHMENT_BYTES <= 0:
     raise SystemExit("❌ 配置错误: max_attachment_bytes 必须大于 0")
+STREAM_TERMINAL = _as_bool(_conf.get("stream_terminal"), True)
+TERMINAL_STREAM_FORMAT = str(_conf.get("terminal_stream_format", "text")).strip().lower()
+if TERMINAL_STREAM_FORMAT not in {"text", "json"}:
+    raise SystemExit("❌ 配置错误: terminal_stream_format 只能是 text 或 json")
 # 会话作用域：
 #   chat_user(默认) 群里按“群+人”分 session：同群不同人各自独立、并行执行
 #   chat            整个群共用一个 session（群内串行、共享上下文）
@@ -334,18 +352,220 @@ def _del_reaction(message_id: str, reaction_id: str) -> None:
         print(f"[reaction del error] {e}")
 
 
-def ask_claude(key: str, text: str, chat_id: str = "", chat_type: str = "") -> str:
-    sid, is_new = _get_or_create_sid(key, chat_id, chat_type)
+def _build_claude_cmd(text: str, sid: str, is_new: bool, output_format: str = "text") -> list[str]:
     flag = "--session-id" if is_new else "--resume"
-    cmd = ["claude", "-p", text, flag, sid, "--output-format", "text", "--model", CLAUDE_MODEL]
+    cmd = ["claude", "-p", text, flag, sid, "--output-format", output_format, "--model", CLAUDE_MODEL]
+    if output_format == "stream-json":
+        cmd += ["--verbose", "--include-partial-messages", "--include-hook-events"]
     if ALLOWED_TOOLS:
         cmd += ["--allowedTools", *ALLOWED_TOOLS]
+    return cmd
+
+
+def _fallback_no_output(stderr: str) -> str:
+    return "(claude 无输出) " + (stderr or "")[:300]
+
+
+def _run_claude_buffered(cmd: list[str]) -> str:
+    r = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=CLAUDE_TIMEOUT, cwd=WORKDIR
+    )
+    out = (r.stdout or "").strip()
+    return out or _fallback_no_output(r.stderr or "")
+
+
+def _pipe_to_queue(pipe, stream_name: str, out_q: "queue.Queue[tuple[str, str]]", by_line: bool) -> None:
     try:
-        r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=CLAUDE_TIMEOUT, cwd=WORKDIR
+        if by_line:
+            for chunk in iter(pipe.readline, ""):
+                out_q.put((stream_name, chunk))
+        else:
+            while True:
+                chunk = pipe.read(1)
+                if not chunk:
+                    break
+                out_q.put((stream_name, chunk))
+    finally:
+        try:
+            pipe.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _short_json(value, limit: int = 600) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False)
+    except TypeError:
+        text = str(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _extract_text_from_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text" and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+        delta = item.get("delta")
+        if isinstance(delta, dict) and isinstance(delta.get("text"), str):
+            parts.append(delta["text"])
+    return "".join(parts)
+
+
+def _handle_stream_json_line(line: str) -> tuple[str, str, bool]:
+    """返回 (终端展示文本, 可作为最终回复候选的文本片段, 是否最终 result)。"""
+    raw = line.strip()
+    if not raw:
+        return "", "", False
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        return f"[claude:raw] {raw}\n", raw + "\n", False
+    if not isinstance(event, dict):
+        return f"[claude:event] {_short_json(event)}\n", "", False
+
+    etype = str(event.get("type") or event.get("event") or "event")
+    subtype = event.get("subtype")
+
+    if etype == "system":
+        model = event.get("model") or event.get("message", {}).get("model", "")
+        sid = event.get("session_id") or event.get("sessionId") or ""
+        detail = " ".join(p for p in [f"subtype={subtype}" if subtype else "", f"model={model}" if model else "", f"session={sid}" if sid else ""] if p)
+        return f"[claude:system] {detail or _short_json(event)}\n", "", False
+
+    if etype == "assistant":
+        message = event.get("message") if isinstance(event.get("message"), dict) else event
+        content = message.get("content")
+        text = _extract_text_from_content(content)
+        tool_lines: list[str] = []
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "tool_use":
+                    name = item.get("name") or item.get("tool_name") or "tool"
+                    tool_input = item.get("input", {})
+                    tool_lines.append(f"[claude:tool] {name} input={_short_json(tool_input)}")
+        terminal = ("\n".join(tool_lines) + ("\n" if tool_lines else ""))
+        if text:
+            terminal += text
+            if not terminal.endswith("\n"):
+                terminal += "\n"
+        return terminal, text, False
+
+    if etype in {"content_block_delta", "message_delta"}:
+        delta = event.get("delta")
+        text = delta.get("text") if isinstance(delta, dict) else ""
+        return (text or ""), (text or ""), False
+
+    if etype == "user":
+        message = event.get("message") if isinstance(event.get("message"), dict) else event
+        content = message.get("content")
+        terminal = _extract_text_from_content(content)
+        return (f"[claude:user] {terminal}\n" if terminal else ""), "", False
+
+    if etype in {"tool_result", "hook", "hook_event"}:
+        return f"[claude:{etype}] {_short_json(event)}\n", "", False
+
+    if etype == "result":
+        result = event.get("result")
+        duration = event.get("duration_ms")
+        cost = event.get("total_cost_usd")
+        meta = " ".join(
+            p for p in [
+                f"subtype={subtype}" if subtype else "",
+                f"duration_ms={duration}" if duration is not None else "",
+                f"cost_usd={cost}" if cost is not None else "",
+            ] if p
         )
-        out = (r.stdout or "").strip()
-        return out or ("(claude 无输出) " + (r.stderr or "")[:300])
+        terminal = f"[claude:result] {meta or _short_json(event)}\n"
+        return terminal, result if isinstance(result, str) else "", True
+
+    return f"[claude:{etype}] {_short_json(event)}\n", "", False
+
+
+def _run_claude_streaming(cmd: list[str], stream_format: str) -> str:
+    print(f"[{_ts()}] ▶ Claude 终端流开始（format={stream_format}，飞书仅发送最终结果）", flush=True)
+    by_line = stream_format == "json"
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=WORKDIR,
+        bufsize=1,
+    )
+    out_q: "queue.Queue[tuple[str, str]]" = queue.Queue()
+    threads = [
+        threading.Thread(target=_pipe_to_queue, args=(proc.stdout, "stdout", out_q, by_line), daemon=True),
+        threading.Thread(target=_pipe_to_queue, args=(proc.stderr, "stderr", out_q, by_line), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    final_candidates: list[str] = []
+    result_text = ""
+    deadline = time.monotonic() + CLAUDE_TIMEOUT
+    timed_out = False
+
+    while True:
+        try:
+            stream_name, chunk = out_q.get(timeout=0.1)
+        except queue.Empty:
+            stream_name = chunk = ""
+
+        if chunk:
+            if stream_name == "stderr":
+                stderr_chunks.append(chunk)
+                sys.stderr.write(chunk)
+                sys.stderr.flush()
+            elif stream_format == "json":
+                terminal, final_piece, is_result = _handle_stream_json_line(chunk)
+                if terminal:
+                    print(terminal, end="", flush=True)
+                if final_piece:
+                    if is_result:
+                        result_text = final_piece
+                    else:
+                        final_candidates.append(final_piece)
+            else:
+                stdout_chunks.append(chunk)
+                print(chunk, end="", flush=True)
+
+        if proc.poll() is not None and out_q.empty() and all(not t.is_alive() for t in threads):
+            break
+        if time.monotonic() > deadline:
+            timed_out = True
+            proc.kill()
+            break
+
+    for t in threads:
+        t.join(timeout=1)
+
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd, CLAUDE_TIMEOUT)
+
+    print(f"\n[{_ts()}] ■ Claude 终端流结束", flush=True)
+    if stream_format == "json":
+        out = (result_text or "".join(final_candidates)).strip()
+    else:
+        out = "".join(stdout_chunks).strip()
+    return out or _fallback_no_output("".join(stderr_chunks))
+
+
+def ask_claude(key: str, text: str, chat_id: str = "", chat_type: str = "") -> str:
+    sid, is_new = _get_or_create_sid(key, chat_id, chat_type)
+    output_format = "stream-json" if STREAM_TERMINAL and TERMINAL_STREAM_FORMAT == "json" else "text"
+    cmd = _build_claude_cmd(text, sid, is_new, output_format)
+    try:
+        if STREAM_TERMINAL:
+            return _run_claude_streaming(cmd, TERMINAL_STREAM_FORMAT)
+        return _run_claude_buffered(cmd)
     except subprocess.TimeoutExpired:
         return "⌛ 处理超时了，换个更具体的问题再试。"
     except Exception as e:  # noqa: BLE001

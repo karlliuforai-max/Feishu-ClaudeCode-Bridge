@@ -6,6 +6,8 @@
   "state_dir": "~/.feishu_bridge",
   "timeout": 600,
   "max_attachment_bytes": 26214400,
+  "stream_terminal": true,
+  "terminal_stream_format": "text",
   "session_scope": "chat_user",
   "allowed_tools": "Read Write Edit Glob Grep WebSearch WebFetch Skill TodoWrite Task",
   "allowed_chats": []

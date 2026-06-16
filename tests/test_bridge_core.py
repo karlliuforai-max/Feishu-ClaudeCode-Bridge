@@ -161,6 +161,46 @@ class BridgeCoreTests(unittest.TestCase):
             self.bridge.urllib.request.urlopen = original_urlopen
             self.bridge.MAX_ATTACHMENT_BYTES = original_limit
 
+    def test_build_claude_cmd_supports_stream_json_mode(self):
+        cmd = self.bridge._build_claude_cmd(
+            "hello",
+            "00000000-0000-0000-0000-000000000000",
+            True,
+            "stream-json",
+        )
+
+        self.assertIn("--output-format", cmd)
+        self.assertIn("stream-json", cmd)
+        self.assertIn("--verbose", cmd)
+        self.assertIn("--include-partial-messages", cmd)
+        self.assertIn("--include-hook-events", cmd)
+
+    def test_stream_json_handler_extracts_terminal_events_and_final_result(self):
+        tool_line, tool_piece, is_result = self.bridge._handle_stream_json_line(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "name": "Read", "input": {"file_path": "a.txt"}},
+                            {"type": "text", "text": "partial"},
+                        ]
+                    },
+                }
+            )
+        )
+        self.assertIn("[claude:tool] Read", tool_line)
+        self.assertIn("partial", tool_line)
+        self.assertEqual(tool_piece, "partial")
+        self.assertFalse(is_result)
+
+        result_line, result_piece, is_result = self.bridge._handle_stream_json_line(
+            json.dumps({"type": "result", "subtype": "success", "result": "final answer"})
+        )
+        self.assertIn("[claude:result]", result_line)
+        self.assertEqual(result_piece, "final answer")
+        self.assertTrue(is_result)
+
 
 if __name__ == "__main__":
     unittest.main()

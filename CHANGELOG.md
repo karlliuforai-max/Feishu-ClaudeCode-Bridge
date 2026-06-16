@@ -9,6 +9,17 @@
 
 - 暂无
 
+## [0.0.5] - 2026-06-16
+
+### 新增
+
+- 新增终端流式输出配置：`stream_terminal` 开启后会在终端实时打印 Claude Code 可见输出，飞书仍只发送最终结果。
+- 新增两档终端流格式：`terminal_stream_format: "text"` 使用基础文本流，`"json"` 使用 Claude Code `stream-json` 事件流并尽量展示系统事件、工具调用和最终结果。
+
+### 文档
+
+- 在 README 路线图中补充 stream-json 结构化事件展示的后续增强计划。
+
 ## [0.0.4] - 2026-06-16
 
 ### 修复
@@ -78,7 +89,8 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.5...HEAD
+[0.0.5]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.1...v0.0.2
