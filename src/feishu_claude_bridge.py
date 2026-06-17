@@ -47,7 +47,7 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
-__version__ = "0.0.6"
+__version__ = "0.0.7"
 # 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
 START_TIME_MS = time.time() * 1000
 
@@ -90,8 +90,17 @@ APP_ID = _conf["app_id"]
 APP_SECRET = _conf["app_secret"]
 
 # 以下均可选：config.json 没写就用默认值
-# claude -p 使用的模型 ID
+# claude -p 使用的默认模型 ID
 CLAUDE_MODEL = _conf.get("model", "claude-opus-4-8")
+# 模型短名 → 完整 model ID，临时切换时少打字（也可直接传完整 ID）
+MODEL_ALIASES = {
+    "opus": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+    "fable": "claude-fable-5",
+}
+# 会话级临时模型覆盖：/model <name> 设置、/model reset 清除；仅存内存，重启即失效
+_SESSION_MODELS: dict[str, str] = {}
 # claude 固定运行目录（决定会话上下文/CLAUDE.md 归属），默认脚本所在目录
 WORKDIR = _expand_path(_conf.get("workdir") or BASE_DIR)
 # session 持久化目录
@@ -359,9 +368,25 @@ def _del_reaction(message_id: str, reaction_id: str) -> None:
         print(f"[reaction del error] {e}")
 
 
-def _build_claude_cmd(text: str, sid: str, is_new: bool, output_format: str = "text") -> list[str]:
+def _resolve_model(name: str) -> str | None:
+    """把用户输入解析成完整 model ID：支持短名(opus/sonnet/haiku/fable)或直接传完整 ID。
+    无法识别返回 None。"""
+    n = (name or "").strip()
+    if not n:
+        return None
+    low = n.lower()
+    if low in MODEL_ALIASES:
+        return MODEL_ALIASES[low]
+    if low.startswith("claude-"):  # 直接给完整 model ID
+        return n
+    return None
+
+
+def _build_claude_cmd(text: str, sid: str, is_new: bool, output_format: str = "text",
+                      model: str = "") -> list[str]:
     flag = "--session-id" if is_new else "--resume"
-    cmd = ["claude", "-p", text, flag, sid, "--output-format", output_format, "--model", CLAUDE_MODEL]
+    cmd = ["claude", "-p", text, flag, sid, "--output-format", output_format,
+           "--model", model or CLAUDE_MODEL]
     if output_format == "stream-json":
         cmd += ["--verbose", "--include-partial-messages", "--include-hook-events"]
     if ALLOWED_TOOLS:
@@ -554,6 +579,10 @@ class _StreamJsonRenderer:
 
     def _on_system(self, event) -> None:
         sub = event.get("subtype")
+        # thinking_tokens 是模型内部思考过程的增量事件，对终端阅读零价值，
+        # 只会刷出几十上百行噪音。直接跳过，仅保留有意义的系统事件。
+        if sub == "thinking_tokens":
+            return
         model = event.get("model") or ""
         bits = [b for b in [f"subtype={sub}" if sub else "", f"model={model}" if model else ""] if b]
         self._line("[system] " + (" ".join(bits) or _short_json(event, 200)))
@@ -694,12 +723,14 @@ def _run_claude_streaming(cmd: list[str], stream_format: str, tag: str = "",
 
 
 def ask_claude(key: str, text: str, chat_id: str = "", chat_type: str = "",
-               text_delta_cb=None) -> str:
+               text_delta_cb=None, model: str = "") -> str:
     sid, is_new = _get_or_create_sid(key, chat_id, chat_type)
+    # 模型优先级：单条覆盖(model) > 会话级覆盖 > 全局默认
+    eff_model = model or _SESSION_MODELS.get(key) or CLAUDE_MODEL
     # 终端 json 档 或 流式回复 都需要 stream-json（前者要结构化事件，后者要增量文本）
     want_json = (STREAM_TERMINAL and TERMINAL_STREAM_FORMAT == "json") or (text_delta_cb is not None)
     output_format = "stream-json" if want_json else "text"
-    cmd = _build_claude_cmd(text, sid, is_new, output_format)
+    cmd = _build_claude_cmd(text, sid, is_new, output_format, eff_model)
     tag = sid[:8]
     try:
         if STREAM_TERMINAL or text_delta_cb:
@@ -721,6 +752,8 @@ _IMG_MARKER = "<<<IMG>>>"
 _IMG_LINE_RE = re.compile(r"^\s*<<<IMG>>>(.+?)\s*$", re.MULTILINE)
 # markdown 图片：![alt](路径)
 _MD_IMG_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+# 单条临时模型前缀：以 [m:模型名] 开头，仅本条生效
+_MODEL_PREFIX_RE = re.compile(r"^\s*\[m:([^\]]+)\]\s*", re.IGNORECASE)
 
 
 def _resolve_local_image(ref: str) -> str | None:
@@ -1165,6 +1198,42 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         reply_to(message_id, chat_id, "🆕 已开启新会话，之前上下文已清空。")
         return
 
+    # 命令：切换/查询本会话的临时模型（仅纯文本、无附件时）
+    if text.startswith("/model") and not attachments:
+        arg = text[len("/model"):].strip()
+        if not arg:  # 查询当前
+            cur = _SESSION_MODELS.get(key)
+            line = (f"当前会话模型：{cur}（临时覆盖）" if cur
+                    else f"当前会话模型：{CLAUDE_MODEL}（全局默认）")
+            reply_to(message_id, chat_id,
+                     line + "\n用法：/model opus|sonnet|haiku|fable 或完整 ID（如 claude-sonnet-4-6）；"
+                            "/model reset 恢复默认。单条临时用前缀 [m:opus] 你的问题")
+            return
+        if arg.lower() in ("reset", "default", "默认"):
+            _SESSION_MODELS.pop(key, None)
+            reply_to(message_id, chat_id, f"↩️ 已恢复全局默认模型：{CLAUDE_MODEL}")
+            return
+        resolved = _resolve_model(arg)
+        if not resolved:
+            reply_to(message_id, chat_id,
+                     f"❓ 无法识别的模型：{arg}\n可用短名：opus / sonnet / haiku / fable，或传完整 model ID")
+            return
+        _SESSION_MODELS[key] = resolved
+        reply_to(message_id, chat_id, f"✅ 本会话模型已切换为：{resolved}（/model reset 或重启后失效）")
+        return
+
+    # 单条临时模型：消息以 [m:xxx] 开头，仅本条生效，识别后剥掉前缀
+    per_msg_model = ""
+    pm = _MODEL_PREFIX_RE.match(text)
+    if pm:
+        resolved = _resolve_model(pm.group(1))
+        if resolved:
+            per_msg_model = resolved
+            text = text[pm.end():]
+            if not text and not attachments:  # 只发了前缀、没正文
+                reply_to(message_id, chat_id, "ℹ️ 检测到模型前缀但没有内容，请在 [m:xxx] 后面带上你的问题。")
+                return
+
     where = "群聊" if chat_type == "group" else "私聊"
     desc = text or f"[{len(attachments)} 个附件]"
     print(f"\n[{_ts()}] 📩 飞书（{where}）收到: {desc}")
@@ -1172,7 +1241,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     # chat_id / message_id 用默认参数绑定，杜绝闭包串扰
     # 直接喂用户原文：不告诉 Claude 它在飞书、不给 chat_id，它就不会想着自己发消息
     def worker(_key=key, _chat=chat_id, _mid=message_id, _text=text, _type=chat_type,
-               _atts=attachments):
+               _atts=attachments, _model=per_msg_model):
         print(f"[{_ts()}] 🤔 Claude 处理中……", flush=True)
         t0 = time.monotonic()
         reaction_id = _add_reaction(_mid)  # ⌨️ 正在输入中…
@@ -1190,7 +1259,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         delta_cb = streamer.push if streamer else None
         try:
             with _key_lock(_key):  # 同会话串行；不同会话并行隔离
-                reply = ask_claude(_key, prompt, _chat, _type, text_delta_cb=delta_cb)
+                reply = ask_claude(_key, prompt, _chat, _type, text_delta_cb=delta_cb, model=_model)
             if reaction_id:
                 _del_reaction(_mid, reaction_id)
             if not (streamer and streamer.finish(reply)):

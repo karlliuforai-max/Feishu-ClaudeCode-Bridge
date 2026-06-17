@@ -9,6 +9,17 @@
 
 - 暂无
 
+## [0.0.7] - 2026-06-17
+
+### 新增
+
+- **临时模型切换**：无需改配置文件即可在运行时动态切换 Claude 模型，支持两种粒度：
+  - **会话级**：发送 `/model <名称>` 切换当前会话后续所有消息使用的模型；`/model reset` 恢复全局默认；`/model`（不带参数）查询当前生效的模型。
+  - **单条级**：消息以 `[m:<名称>]` 开头，仅本条使用该模型，下一条自动恢复，前缀不传入提示词。
+  - 支持短名（`opus` / `sonnet` / `haiku` / `fable`）和完整 model ID（如 `claude-sonnet-4-6`）。
+  - 优先级：单条前缀 > 会话级 `/model` > `config.json` 全局默认。会话级覆盖仅存内存，重启自动失效。
+  - 输入无法识别的名称时回复提示，不会拿错模型运行。
+
 ## [0.0.6] - 2026-06-16
 
 ### 新增
@@ -109,7 +120,9 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.7...HEAD
+[0.0.7]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.6...v0.0.7
+[0.0.6]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.2...v0.0.3
