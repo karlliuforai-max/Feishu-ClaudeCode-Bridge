@@ -7,7 +7,40 @@
 
 ## [Unreleased]
 
-- 暂无
+暂无
+
+## [0.2.0] - 2026-06-18
+
+### 新增
+
+- **Agent Gateway**：同一个飞书机器人、同一个 `app_id` 现在可通过 `/agent` 在 Claude Code 与 Codex 之间切换。
+- 新增 `/agent` 命令：
+  - `/agent` 查询当前 Agent 与模型。
+  - `/agent claude` 切换到 Claude Code。
+  - `/agent codex` 切换到 Codex。
+  - `/agent reset` 恢复配置里的默认 Agent。
+- 新增 Codex 后端：使用 `codex exec` / `codex exec resume` 无头执行，并通过 `--output-last-message` 捕获最终回复。
+- 新增 Agent 独立 session 状态：Claude 和 Codex 的会话 ID 分开保存，切换 Agent 不污染对方上下文。
+- 新增 Codex 配置项：`codex_model`、`codex_sandbox`、`codex_approval`、`codex_skip_git_repo_check`。
+- 新增 `docs/VERSIONING.md` 与 v0.1.0 设计文档，记录版本边界、状态迁移和发布检查项。
+
+### 变更
+
+- 运行时版本升为 `0.2.0`。
+- Claude 默认模型从 `claude-opus-4-8` 调整为 `claude-sonnet-4-6`。
+- Codex 在 v0.2.0 固定使用 `gpt-5.5`，不参与 `/model` 或 `[m:...]` 切换。
+- `/new` / `/reset` 现在只重置当前激活 Agent 的 session，不清空另一个 Agent 的上下文。
+- README 更新为飞书 Agent Gateway 说明，补充 Claude/Codex 双后端配置与命令。
+
+### 迁移
+
+- 旧 `sessions.json` 中的字符串 sid 和顶层 `sid` 对象会懒迁移为多 Agent 状态结构。
+- 旧配置继续兼容；不配置 `default_agent` 时默认仍为 `claude`。
+
+### 测试
+
+- 补充默认模型、旧 session 迁移、`/agent` 切换、Codex 命令构造等单元测试。
+- 在缺少 `lark-oapi` 的本地测试环境中，模块可用最小 fallback 完成核心单元测试导入。
 
 ## [0.0.7] - 2026-06-17
 
@@ -120,7 +153,8 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.7...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.7...v0.2.0
 [0.0.7]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.4...v0.0.5

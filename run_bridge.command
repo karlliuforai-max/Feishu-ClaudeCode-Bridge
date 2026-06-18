@@ -1,12 +1,12 @@
 #!/bin/zsh
-# 飞书 ↔ Claude 桥 启动器（双击即在 Terminal.app 打开运行）
+# 飞书 Agent Gateway 启动器（双击即在 Terminal.app 打开运行）
 # 独立于 VS Code：关掉 VS Code 不影响本窗口。
 # 关掉本终端窗口 = 停止桥。崩溃会自动重启（Ctrl-C 可彻底退出）。
 
 cd "$(dirname "$0")" || exit 1
 
 echo "================================================"
-echo "  飞书 ↔ Claude 桥"
+echo "  飞书 Agent Gateway"
 echo "  目录: $(pwd)"
 echo "  开始: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "  停止: 关闭本窗口，或按 Ctrl-C"

@@ -2,24 +2,26 @@
 """
 feishu_claude_bridge.py
 
-飞书消息 <-> Claude Code 无头模式 桥。
-大脑 = `claude -p`（复用 Claude Code 已登录授权，无需 Anthropic API key）。
+飞书消息 <-> Claude Code / Codex 无头模式 Agent Gateway。
+大脑 = `claude -p` 或 `codex exec`（复用本机已登录 CLI）。
 收发 = lark_oapi（飞书消息 encode/decode + WebSocket 长连接，断线自动重连）。
 
 自动行为：
   - 自动连接飞书并自动重连
   - 私聊(P2P)：直接回复
   - 群聊：仅当 @ 机器人时回复（避免刷屏）
-  - 收文本/图片/文件/富文本(post)：图片与文件自动下载到本地交给 claude 查看处理
+  - /agent claude|codex：同一飞书会话内切换 Agent
+  - 收文本/图片/文件/富文本(post)：图片与文件自动下载到本地交给当前 Agent 查看处理
   - 发图片：回复里写 <<<IMG>>>路径 或 ![](本地路径)，自动上传成飞书图片消息
-  - 每个会话（私聊=每人 / 群=每群）首条自动新建 session，之后自动续接
-  - 持久化 session：chat 映射落盘 + claude 会话 --resume，重启不丢上下文
+  - 每个会话和每个 Agent 独立维护 session，之后自动续接
+  - 持久化 session：chat 映射落盘 + Agent 会话 resume，重启不丢上下文
   - 多 session 并行隔离：不同会话独立进程；同会话加锁串行
-  - 命令：发送 /new 或 /reset 在当前会话开启一个全新 session
+  - 命令：发送 /new 或 /reset 为当前 Agent 开启一个全新 session
 
 配置：默认读项目根目录的 config.json（不入库），字段见 README。
   必填: app_id, app_secret
-  可选: model(默认 claude-opus-4-8) / workdir / state_dir / timeout /
+  可选: default_agent / model(默认 claude-sonnet-4-6) / codex_model(gpt-5.5) /
+        workdir / state_dir / timeout /
         max_attachment_bytes / stream_terminal / terminal_stream_format /
         stream_reply / stream_reply_interval /
         session_scope(chat_user|chat|user) / allowed_tools / allowed_chats
@@ -31,30 +33,80 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
 import uuid
+from types import SimpleNamespace
 
-import lark_oapi as lark
-from lark_oapi.api.im.v1 import (
-    CreateImageRequest,
-    CreateImageRequestBody,
-    CreateMessageRequest,
-    CreateMessageRequestBody,
-    P2ImMessageReceiveV1,
-    ReplyMessageRequest,
-    ReplyMessageRequestBody,
-)
+try:
+    import lark_oapi as lark
+    from lark_oapi.api.im.v1 import (
+        CreateImageRequest,
+        CreateImageRequestBody,
+        CreateMessageRequest,
+        CreateMessageRequestBody,
+        P2ImMessageReceiveV1,
+        ReplyMessageRequest,
+        ReplyMessageRequestBody,
+    )
+    LARK_AVAILABLE = True
+except ModuleNotFoundError:
+    LARK_AVAILABLE = False
 
-__version__ = "0.0.7"
+    class _MissingLarkBuilder:
+        def __getattr__(self, _name):
+            def _method(*_args, **_kwargs):
+                return self
+            return _method
+
+        def build(self):
+            return SimpleNamespace()
+
+    class _MissingLarkRequest:
+        @classmethod
+        def builder(cls):
+            return _MissingLarkBuilder()
+
+    class _MissingLarkClient:
+        @classmethod
+        def builder(cls):
+            return _MissingLarkBuilder()
+
+    class _MissingLarkDispatcher:
+        @classmethod
+        def builder(cls, *_args, **_kwargs):
+            return _MissingLarkBuilder()
+
+    lark = SimpleNamespace(
+        Client=_MissingLarkClient,
+        EventDispatcherHandler=_MissingLarkDispatcher,
+        ws=SimpleNamespace(Client=_MissingLarkClient),
+        LogLevel=SimpleNamespace(WARNING="WARNING"),
+    )
+    CreateImageRequest = _MissingLarkRequest
+    CreateImageRequestBody = _MissingLarkRequest
+    CreateMessageRequest = _MissingLarkRequest
+    CreateMessageRequestBody = _MissingLarkRequest
+    P2ImMessageReceiveV1 = object
+    ReplyMessageRequest = _MissingLarkRequest
+    ReplyMessageRequestBody = _MissingLarkRequest
+
+__version__ = "0.2.0"
 # 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
 START_TIME_MS = time.time() * 1000
 
 
 def _expand_path(path: str) -> str:
     """展开配置里的 ~ 和环境变量，并转成绝对路径。"""
-    return os.path.abspath(os.path.expandvars(os.path.expanduser(str(path))))
+    raw = str(path)
+    if raw == "~" or raw.startswith(("~/", "~\\")):
+        home = os.environ.get("HOME")
+        if home:
+            rest = raw[2:] if len(raw) > 1 else ""
+            raw = os.path.join(home, rest)
+    return os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))
 
 
 def _as_bool(value, default: bool = False) -> bool:
@@ -90,8 +142,21 @@ APP_ID = _conf["app_id"]
 APP_SECRET = _conf["app_secret"]
 
 # 以下均可选：config.json 没写就用默认值
+# Agent 选择：默认继续走 Claude；同一飞书会话可用 /agent 切换到 Codex。
+VALID_AGENTS = {"claude", "codex"}
+DEFAULT_AGENT = str(_conf.get("default_agent", "claude")).strip().lower()
+if DEFAULT_AGENT not in VALID_AGENTS:
+    raise SystemExit("❌ 配置错误: default_agent 只能是 claude 或 codex")
+
 # claude -p 使用的默认模型 ID
-CLAUDE_MODEL = _conf.get("model", "claude-opus-4-8")
+CLAUDE_MODEL = _conf.get("model", "claude-sonnet-4-6")
+# Codex v0.2.0 固定单模型，避免与 Claude 的 /model 体系混在一起。
+CODEX_MODEL = str(_conf.get("codex_model", "gpt-5.5")).strip()
+if CODEX_MODEL != "gpt-5.5":
+    raise SystemExit("❌ 配置错误: v0.2.0 的 codex_model 只能是 gpt-5.5")
+CODEX_SANDBOX = str(_conf.get("codex_sandbox", "workspace-write")).strip() or "workspace-write"
+CODEX_APPROVAL = str(_conf.get("codex_approval", "never")).strip() or "never"
+CODEX_SKIP_GIT_REPO_CHECK = _as_bool(_conf.get("codex_skip_git_repo_check"), True)
 # 模型短名 → 完整 model ID，临时切换时少打字（也可直接传完整 ID）
 MODEL_ALIASES = {
     "opus": "claude-opus-4-8",
@@ -255,36 +320,205 @@ def _key_lock(key: str) -> threading.Lock:
         return lk
 
 
-def _reset_session(key: str) -> None:
-    with _sessions_guard:
-        if key in SESSIONS:
-            del SESSIONS[key]
-            _save_sessions()
+def _normalize_agent(name: str | None) -> str:
+    agent = (name or DEFAULT_AGENT).strip().lower()
+    return agent if agent in VALID_AGENTS else DEFAULT_AGENT
 
 
-def _get_or_create_sid(key: str, chat_id: str = "", chat_type: str = "") -> tuple[str, bool]:
+def _normalize_session_record(rec) -> tuple[dict, bool]:
+    """把旧 sessions.json 记录懒迁移成 v0.2.0 多 Agent 结构。"""
+    changed = False
+    if isinstance(rec, str):
+        return {
+            "agent": DEFAULT_AGENT,
+            "sessions": {"claude": {"sid": rec}},
+            "models": {},
+        }, True
+    if not isinstance(rec, dict):
+        return {
+            "agent": DEFAULT_AGENT,
+            "sessions": {},
+            "models": {},
+        }, True
+
+    out = dict(rec)
+    legacy_sid = out.pop("sid", None)
+    sessions = out.get("sessions")
+    if not isinstance(sessions, dict):
+        sessions = {}
+        changed = True
+    if legacy_sid and not sessions.get("claude"):
+        sessions["claude"] = {"sid": legacy_sid}
+        changed = True
+    for agent, value in list(sessions.items()):
+        if agent not in VALID_AGENTS:
+            del sessions[agent]
+            changed = True
+            continue
+        if isinstance(value, str):
+            sessions[agent] = {"sid": value}
+            changed = True
+        elif not isinstance(value, dict):
+            sessions[agent] = {}
+            changed = True
+    out["sessions"] = sessions
+
+    agent = _normalize_agent(out.get("agent"))
+    if out.get("agent") != agent:
+        out["agent"] = agent
+        changed = True
+    if not isinstance(out.get("models"), dict):
+        out["models"] = {}
+        changed = True
+    return out, changed
+
+
+def _ensure_session_record(key: str, chat_id: str = "", chat_type: str = "") -> dict:
     with _sessions_guard:
         rec = SESSIONS.get(key)
-        if isinstance(rec, str):  # 旧格式：纯 sid 字符串，原地升级为对象
-            rec = SESSIONS[key] = {"sid": rec}
-            _save_sessions()
-        if rec:
-            return rec["sid"], False
-    # 新 session：标记来源（可能调飞书 API），放在锁外避免网络阻塞其他会话
+        if rec is not None:
+            normalized, changed = _normalize_session_record(rec)
+            SESSIONS[key] = normalized
+            if changed:
+                _save_sessions()
+            return normalized
+
     mark = _mark_chat(chat_id, chat_type)
     with _sessions_guard:
         rec = SESSIONS.get(key)
-        if isinstance(rec, dict):  # 并发竞争：别的线程已创建
-            return rec["sid"], False
+        if rec is not None:
+            normalized, changed = _normalize_session_record(rec)
+            SESSIONS[key] = normalized
+            if changed:
+                _save_sessions()
+            return normalized
         rec = {
-            "sid": str(uuid.uuid4()),
+            "agent": DEFAULT_AGENT,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             **mark,
+            "sessions": {},
+            "models": {},
         }
         SESSIONS[key] = rec
         _save_sessions()
-        print(f"[{_ts()}] 🆕 开启新会话（{mark.get('chat_name') or '私聊'}）")
-        return rec["sid"], True
+        return rec
+
+
+def _get_active_agent(key: str, chat_id: str = "", chat_type: str = "") -> str:
+    rec = _ensure_session_record(key, chat_id, chat_type)
+    return _normalize_agent(rec.get("agent"))
+
+
+def _set_active_agent(key: str, agent: str, chat_id: str = "", chat_type: str = "") -> str:
+    agent = _normalize_agent(agent)
+    _ensure_session_record(key, chat_id, chat_type)
+    with _sessions_guard:
+        rec, _changed = _normalize_session_record(SESSIONS.get(key))
+        rec["agent"] = agent
+        SESSIONS[key] = rec
+        _save_sessions()
+    return agent
+
+
+def _get_agent_sid(key: str, agent: str, chat_id: str = "", chat_type: str = "") -> str | None:
+    agent = _normalize_agent(agent)
+    rec = _ensure_session_record(key, chat_id, chat_type)
+    session = rec.get("sessions", {}).get(agent)
+    return session.get("sid") if isinstance(session, dict) else None
+
+
+def _save_agent_sid(key: str, agent: str, sid: str, chat_id: str = "", chat_type: str = "") -> None:
+    if not sid:
+        return
+    agent = _normalize_agent(agent)
+    _ensure_session_record(key, chat_id, chat_type)
+    with _sessions_guard:
+        rec, _changed = _normalize_session_record(SESSIONS.get(key))
+        sessions = rec.setdefault("sessions", {})
+        sessions[agent] = {"sid": sid}
+        SESSIONS[key] = rec
+        _save_sessions()
+
+
+def _reset_agent_session(key: str, agent: str | None = None,
+                         chat_id: str = "", chat_type: str = "") -> str:
+    active = _normalize_agent(agent) if agent else _get_active_agent(key, chat_id, chat_type)
+    _ensure_session_record(key, chat_id, chat_type)
+    with _sessions_guard:
+        rec, _changed = _normalize_session_record(SESSIONS.get(key))
+        sessions = rec.setdefault("sessions", {})
+        sessions.pop(active, None)
+        SESSIONS[key] = rec
+        _save_sessions()
+    if active == "claude":
+        _SESSION_MODELS.pop(key, None)
+    return active
+
+
+def _reset_session(key: str) -> None:
+    _reset_agent_session(key)
+
+
+def _get_or_create_agent_sid(key: str, agent: str, chat_id: str = "",
+                             chat_type: str = "") -> tuple[str, bool]:
+    agent = _normalize_agent(agent)
+    sid = _get_agent_sid(key, agent, chat_id, chat_type)
+    if sid:
+        return sid, False
+    sid = str(uuid.uuid4())
+    _save_agent_sid(key, agent, sid, chat_id, chat_type)
+    rec = _ensure_session_record(key, chat_id, chat_type)
+    print(f"[{_ts()}] 🆕 开启新 {agent} 会话（{rec.get('chat_name') or '私聊'}）")
+    return sid, True
+
+
+def _get_or_create_sid(key: str, chat_id: str = "", chat_type: str = "") -> tuple[str, bool]:
+    return _get_or_create_agent_sid(key, "claude", chat_id, chat_type)
+
+
+def _agent_model(agent: str, key: str = "", override: str = "") -> str:
+    agent = _normalize_agent(agent)
+    if agent == "codex":
+        return CODEX_MODEL
+    return override or _SESSION_MODELS.get(key, "") or CLAUDE_MODEL
+
+
+def _agent_display_name(agent: str) -> str:
+    return "Codex" if _normalize_agent(agent) == "codex" else "Claude"
+
+
+def _agent_supports_stream_reply(agent: str) -> bool:
+    return _normalize_agent(agent) == "claude"
+
+
+def _format_agent_status(key: str, chat_id: str = "", chat_type: str = "") -> str:
+    agent = _get_active_agent(key, chat_id, chat_type)
+    model = _agent_model(agent, key)
+    lines = [
+        f"当前 Agent：{_agent_display_name(agent)}",
+        f"当前模型：{model}",
+        "可用命令：/agent claude、/agent codex、/agent reset",
+    ]
+    if agent == "codex":
+        lines.append("Codex 在 v0.2.0 固定使用 gpt-5.5，不支持 /model 切换。")
+    return "\n".join(lines)
+
+
+def _handle_agent_command(key: str, text: str, chat_id: str = "", chat_type: str = "") -> str:
+    arg = text[len("/agent"):].strip().lower()
+    if not arg:
+        return _format_agent_status(key, chat_id, chat_type)
+    if arg in {"reset", "default", "默认"}:
+        agent = _set_active_agent(key, DEFAULT_AGENT, chat_id, chat_type)
+        return f"已恢复默认 Agent：{_agent_display_name(agent)}（模型：{_agent_model(agent, key)}）"
+    if arg not in VALID_AGENTS:
+        return "无法识别的 Agent。可用：/agent claude、/agent codex、/agent reset"
+    agent = _set_active_agent(key, arg, chat_id, chat_type)
+    return f"已切换到 {_agent_display_name(agent)}（模型：{_agent_model(agent, key)}）"
+
+
+def _is_slash_command(text: str, command: str) -> bool:
+    return text == command or text.startswith(command + " ")
 
 
 # ---------- tenant token 缓存（供 urllib patch 使用）----------
@@ -745,6 +979,174 @@ def ask_claude(key: str, text: str, chat_id: str = "", chat_type: str = "",
         return f"❌ 处理出错：{e}"
 
 
+def _build_codex_cmd(text: str, sid: str | None, output_file: str,
+                     model: str = "") -> list[str]:
+    model = model or CODEX_MODEL
+    if sid:
+        cmd = [
+            "codex", "exec", "resume",
+            "--json",
+            "--output-last-message", output_file,
+            "--model", model,
+        ]
+        if CODEX_SKIP_GIT_REPO_CHECK:
+            cmd.append("--skip-git-repo-check")
+        cmd += [sid, text]
+        return cmd
+
+    cmd = [
+        "codex", "exec",
+        "--json",
+        "--output-last-message", output_file,
+        "--model", model,
+        "--cd", WORKDIR,
+        "--sandbox", CODEX_SANDBOX,
+        "--ask-for-approval", CODEX_APPROVAL,
+    ]
+    if CODEX_SKIP_GIT_REPO_CHECK:
+        cmd.append("--skip-git-repo-check")
+    cmd.append(text)
+    return cmd
+
+
+def _extract_codex_session_id(value) -> str | None:
+    if isinstance(value, dict):
+        for key in ("session_id", "conversation_id", "thread_id"):
+            val = value.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        for val in value.values():
+            found = _extract_codex_session_id(val)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _extract_codex_session_id(item)
+            if found:
+                return found
+    return None
+
+
+def _codex_event_text(event: dict) -> str:
+    etype = str(event.get("type") or event.get("event") or "event")
+    if etype in {"assistant_message", "agent_message", "message"}:
+        text = event.get("message") or event.get("text") or event.get("content") or ""
+        if isinstance(text, str):
+            return f"[codex {etype}] {_truncate(text, 300)}"
+    if etype in {"error", "turn_failed"}:
+        return f"⚠️ [codex {etype}] {_short_json(event, 300)}"
+    if etype in {"session", "session_created", "turn_started", "turn_completed", "result"}:
+        return f"[codex {etype}] {_short_json(event, 220)}"
+    return f"[codex {etype}]"
+
+
+def _run_codex_streaming(cmd: list[str], output_file: str, tag: str = "") -> tuple[str, str | None]:
+    if STREAM_TERMINAL:
+        print(f"[{_ts()}] ▶ Codex 开始 [{tag or 'new'}]", flush=True)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=WORKDIR,
+        bufsize=1,
+    )
+    out_q: "queue.Queue[tuple[str, str]]" = queue.Queue()
+    threads = [
+        threading.Thread(target=_pipe_to_queue, args=(proc.stdout, "stdout", out_q, True), daemon=True),
+        threading.Thread(target=_pipe_to_queue, args=(proc.stderr, "stderr", out_q, True), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    stdout_lines: list[str] = []
+    stderr_chunks: list[str] = []
+    session_id = None
+    deadline = time.monotonic() + CLAUDE_TIMEOUT
+    timed_out = False
+
+    while True:
+        try:
+            stream_name, chunk = out_q.get(timeout=0.1)
+        except queue.Empty:
+            stream_name = chunk = ""
+
+        if chunk:
+            if stream_name == "stderr":
+                stderr_chunks.append(chunk)
+                if STREAM_TERMINAL:
+                    sys.stderr.write(chunk)
+                    sys.stderr.flush()
+            else:
+                stdout_lines.append(chunk)
+                raw = chunk.strip()
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    if STREAM_TERMINAL and raw:
+                        print(f"[codex raw] {_truncate(raw, 300)}", flush=True)
+                else:
+                    session_id = session_id or _extract_codex_session_id(event)
+                    if STREAM_TERMINAL:
+                        print(_codex_event_text(event), flush=True)
+
+        if proc.poll() is not None and out_q.empty() and all(not t.is_alive() for t in threads):
+            break
+        if time.monotonic() > deadline:
+            timed_out = True
+            proc.kill()
+            break
+
+    for t in threads:
+        t.join(timeout=1)
+
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd, CLAUDE_TIMEOUT)
+
+    try:
+        with open(output_file, encoding="utf-8") as f:
+            final_text = f.read().strip()
+    except OSError:
+        final_text = ""
+
+    if STREAM_TERMINAL:
+        print(f"\n[{_ts()}] ■ Codex 结束 [{tag or (session_id or 'new')[:8]}]", flush=True)
+    fallback = "".join(stdout_lines).strip() or "".join(stderr_chunks).strip()
+    return final_text or "(codex 无输出) " + fallback[:300], session_id
+
+
+def ask_codex(key: str, text: str, chat_id: str = "", chat_type: str = "") -> str:
+    sid = _get_agent_sid(key, "codex", chat_id, chat_type)
+    tag = sid[:8] if sid else "new"
+    fd, output_file = tempfile.mkstemp(prefix="codex-last-", suffix=".txt", dir=STATE_DIR)
+    os.close(fd)
+    cmd = _build_codex_cmd(text, sid, output_file, CODEX_MODEL)
+    try:
+        reply, seen_sid = _run_codex_streaming(cmd, output_file, tag=tag)
+        if seen_sid:
+            _save_agent_sid(key, "codex", seen_sid, chat_id, chat_type)
+        elif sid is None:
+            print("[warn] Codex 未返回 session_id，本轮回复可用但无法持久续接")
+        return reply
+    except subprocess.TimeoutExpired:
+        return "⌛ Codex 处理超时了，换个更具体的问题再试。"
+    except Exception as e:  # noqa: BLE001
+        return f"❌ Codex 处理出错：{e}"
+    finally:
+        try:
+            os.remove(output_file)
+        except OSError:
+            pass
+
+
+def ask_agent(key: str, text: str, chat_id: str = "", chat_type: str = "",
+              text_delta_cb=None, model: str = "", agent: str = "") -> str:
+    agent = _normalize_agent(agent) if agent else _get_active_agent(key, chat_id, chat_type)
+    if agent == "codex":
+        return ask_codex(key, text, chat_id, chat_type)
+    return ask_claude(key, text, chat_id, chat_type, text_delta_cb=text_delta_cb, model=model)
+
+
 # ---------- 飞书收发 ----------
 _CARD_MARKER = "<<<CARD>>>"
 _IMG_MARKER = "<<<IMG>>>"
@@ -1142,7 +1544,7 @@ def _parse_message(msg) -> tuple[str | None, list[dict]]:
 
 
 def _build_media_prompt(caption: str, paths: list[str]) -> str:
-    """把下载好的本地文件路径拼进给 claude 的提示词。"""
+    """把下载好的本地文件路径拼进给当前 Agent 的提示词。"""
     listing = "\n".join(f"- {p}" for p in paths)
     head = ("用户发来以下本地文件（已下载到本机，可用 Read 等工具查看后处理）：\n"
             f"{listing}")
@@ -1192,14 +1594,30 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     else:  # chat_user：群+人；私聊里同一人始终一致
         key = "c:" + chat_id + ":u:" + uid
 
+    active_agent = _get_active_agent(key, chat_id, chat_type)
+
+    # 命令：切换/查询当前会话使用的 Agent（仅纯文本、无附件时）
+    if _is_slash_command(text, "/agent") and not attachments:
+        reply_to(message_id, chat_id, _handle_agent_command(key, text, chat_id, chat_type))
+        return
+
     # 命令：开启新 session（仅纯文本命令、无附件时）
     if text in RESET_CMDS and not attachments:
-        _reset_session(key)
-        reply_to(message_id, chat_id, "🆕 已开启新会话，之前上下文已清空。")
+        reset_agent = _reset_agent_session(key, active_agent, chat_id, chat_type)
+        reply_to(message_id, chat_id, f"🆕 已开启新的 {_agent_display_name(reset_agent)} 会话，之前该 Agent 的上下文已清空。")
         return
 
     # 命令：切换/查询本会话的临时模型（仅纯文本、无附件时）
-    if text.startswith("/model") and not attachments:
+    if _is_slash_command(text, "/model") and not attachments:
+        if active_agent == "codex":
+            reply_to(
+                message_id,
+                chat_id,
+                "当前 Agent：Codex\n当前模型：gpt-5.5\n"
+                "Codex 在 v0.2.0 固定使用 gpt-5.5，不支持 /model 切换。"
+                "如需切换 Claude 模型，请先发送 /agent claude。",
+            )
+            return
         arg = text[len("/model"):].strip()
         if not arg:  # 查询当前
             cur = _SESSION_MODELS.get(key)
@@ -1226,6 +1644,14 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     per_msg_model = ""
     pm = _MODEL_PREFIX_RE.match(text)
     if pm:
+        if active_agent == "codex":
+            reply_to(
+                message_id,
+                chat_id,
+                "Codex 在 v0.2.0 固定使用 gpt-5.5，不支持 [m:...] 单条模型前缀。"
+                "请去掉前缀，或先发送 /agent claude。",
+            )
+            return
         resolved = _resolve_model(pm.group(1))
         if resolved:
             per_msg_model = resolved
@@ -1241,8 +1667,9 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     # chat_id / message_id 用默认参数绑定，杜绝闭包串扰
     # 直接喂用户原文：不告诉 Claude 它在飞书、不给 chat_id，它就不会想着自己发消息
     def worker(_key=key, _chat=chat_id, _mid=message_id, _text=text, _type=chat_type,
-               _atts=attachments, _model=per_msg_model):
-        print(f"[{_ts()}] 🤔 Claude 处理中……", flush=True)
+               _atts=attachments, _model=per_msg_model, _agent=active_agent):
+        agent_name = _agent_display_name(_agent)
+        print(f"[{_ts()}] 🤔 {agent_name} 处理中……", flush=True)
         t0 = time.monotonic()
         reaction_id = _add_reaction(_mid)  # ⌨️ 正在输入中…
         # 下载附件（图片/文件）到本地，把路径拼进提示词
@@ -1254,17 +1681,20 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         prompt = _build_media_prompt(_text, paths) if paths else _text
         if not prompt:  # 附件全部下载失败、又无文字
             prompt = "用户发来了附件但下载失败，请告知用户重发或换种方式。"
-        # 流式回复：边生成边更新卡片；任一环节失败 finish() 返回 False，退回普通 reply_to
-        streamer = CardStreamer(_mid, _chat, STREAM_REPLY_INTERVAL) if STREAM_REPLY else None
+        # 流式回复：Claude 保持边生成边更新卡片；Codex v0.2.0 暂以最终回复兜底。
+        streamer = (CardStreamer(_mid, _chat, STREAM_REPLY_INTERVAL)
+                    if STREAM_REPLY and _agent_supports_stream_reply(_agent) else None)
         delta_cb = streamer.push if streamer else None
         try:
             with _key_lock(_key):  # 同会话串行；不同会话并行隔离
-                reply = ask_claude(_key, prompt, _chat, _type, text_delta_cb=delta_cb, model=_model)
+                reply = ask_agent(
+                    _key, prompt, _chat, _type, text_delta_cb=delta_cb, model=_model, agent=_agent
+                )
             if reaction_id:
                 _del_reaction(_mid, reaction_id)
             if not (streamer and streamer.finish(reply)):
                 reply_to(_mid, _chat, reply)
-            print(f"[{_ts()}] 💬 Claude 回复（耗时 {time.monotonic() - t0:.0f}s）:\n{reply}\n")
+            print(f"[{_ts()}] 💬 {agent_name} 回复（耗时 {time.monotonic() - t0:.0f}s）:\n{reply}\n")
         finally:
             for p in paths:  # 处理完清理下载的临时文件
                 try:
@@ -1290,8 +1720,11 @@ if hasattr(_dispatch, "register_p2_im_message_reaction_deleted_v1"):
 handler = _dispatch.build()
 
 if __name__ == "__main__":
-    print(f"✅ 飞书 ↔ Claude 桥 v{__version__} 已就绪，正在连接飞书…… 在飞书里私聊机器人、或群里 @ 它发消息即可。")
-    print("   （下面只显示你的消息、Claude 处理与回复；关闭本窗口即停止服务）\n")
+    if not LARK_AVAILABLE:
+        raise SystemExit("❌ 缺少依赖 lark-oapi，请先运行: pip install -r requirements.txt")
+    print(f"✅ 飞书 Agent Gateway v{__version__} 已就绪，正在连接飞书……")
+    print(f"   默认 Agent：{_agent_display_name(DEFAULT_AGENT)}；Claude={CLAUDE_MODEL}；Codex={CODEX_MODEL}")
+    print("   在飞书里私聊机器人、或群里 @ 它发消息即可；用 /agent claude|codex 切换。\n")
     # 只显示 WARNING 及以上的 SDK 日志，过滤掉 connected / 心跳等噪音
     ws = lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.WARNING)
     ws.start()  # 阻塞、自动重连

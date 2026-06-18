@@ -71,6 +71,42 @@ class BridgeCoreTests(unittest.TestCase):
             os.path.abspath(str(self.home / "bridge-state")),
         )
 
+    def test_default_agent_models_are_v020_defaults(self):
+        self.assertEqual(self.bridge.CLAUDE_MODEL, "claude-sonnet-4-6")
+        self.assertEqual(self.bridge.CODEX_MODEL, "gpt-5.5")
+        self.assertEqual(self.bridge.DEFAULT_AGENT, "claude")
+        self.assertEqual(self.bridge._agent_model("codex"), "gpt-5.5")
+
+    def test_legacy_session_records_are_migrated_to_agent_shape(self):
+        rec, changed = self.bridge._normalize_session_record("old-claude-sid")
+        self.assertTrue(changed)
+        self.assertEqual(rec["agent"], "claude")
+        self.assertEqual(rec["sessions"]["claude"]["sid"], "old-claude-sid")
+
+        rec, changed = self.bridge._normalize_session_record(
+            {"sid": "old-object-sid", "chat_id": "oc_x"}
+        )
+        self.assertTrue(changed)
+        self.assertEqual(rec["chat_id"], "oc_x")
+        self.assertEqual(rec["sessions"]["claude"]["sid"], "old-object-sid")
+
+    def test_agent_command_switches_only_current_session(self):
+        key = "test-agent-switch"
+        self.bridge.SESSIONS.pop(key, None)
+        try:
+            self.assertIn("当前 Agent：Claude", self.bridge._handle_agent_command(key, ""))
+            msg = self.bridge._handle_agent_command(key, "/agent codex")
+            self.assertIn("Codex", msg)
+            self.assertEqual(self.bridge._get_active_agent(key), "codex")
+            self.assertEqual(self.bridge._agent_model("codex", key), "gpt-5.5")
+
+            msg = self.bridge._handle_agent_command(key, "/agent claude")
+            self.assertIn("Claude", msg)
+            self.assertEqual(self.bridge._get_active_agent(key), "claude")
+        finally:
+            self.bridge.SESSIONS.pop(key, None)
+            self.bridge._save_sessions()
+
     def test_bot_mention_fails_closed_when_open_id_unknown(self):
         original = self.bridge._get_bot_open_id_cached
         msg = SimpleNamespace(
@@ -174,6 +210,26 @@ class BridgeCoreTests(unittest.TestCase):
         self.assertIn("--verbose", cmd)
         self.assertIn("--include-partial-messages", cmd)
         self.assertIn("--include-hook-events", cmd)
+
+    def test_build_codex_cmd_new_and_resume(self):
+        out = str(self.root / "codex-last.txt")
+        new_cmd = self.bridge._build_codex_cmd("hello", None, out)
+        self.assertEqual(new_cmd[:2], ["codex", "exec"])
+        self.assertIn("--model", new_cmd)
+        self.assertIn("gpt-5.5", new_cmd)
+        self.assertIn("--cd", new_cmd)
+        self.assertIn(self.bridge.WORKDIR, new_cmd)
+        self.assertIn("--sandbox", new_cmd)
+        self.assertIn(self.bridge.CODEX_SANDBOX, new_cmd)
+        self.assertIn("--ask-for-approval", new_cmd)
+        self.assertIn(self.bridge.CODEX_APPROVAL, new_cmd)
+        self.assertIn("--output-last-message", new_cmd)
+        self.assertIn(out, new_cmd)
+
+        resume_cmd = self.bridge._build_codex_cmd("again", "codex-session-id", out)
+        self.assertEqual(resume_cmd[:3], ["codex", "exec", "resume"])
+        self.assertIn("codex-session-id", resume_cmd)
+        self.assertIn("--output-last-message", resume_cmd)
 
     def test_summarize_tool_picks_friendly_field(self):
         s = self.bridge._summarize_tool
