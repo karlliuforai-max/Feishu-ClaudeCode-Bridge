@@ -37,37 +37,55 @@ class ResolveDirsTests(BridgeTestCase):
 
 
 class MigrateLegacySessionsTests(BridgeTestCase):
+    OWNER = "cli_owner_app"
+
+    def setUp(self):
+        # 把“归属应用”固定为 OWNER，隔离掉真实根 config.json 的影响
+        self._orig_owner = self.config._legacy_owner_app_id
+        self.config._legacy_owner_app_id = lambda: self.OWNER
+
+    def tearDown(self):
+        self.config._legacy_owner_app_id = self._orig_owner
+
     def _legacy_path(self):
         return self.config._expand_path(os.path.join("~/.feishu_bridge", "sessions.json"))
 
-    def test_migrates_legacy_into_app_subdir(self):
+    def _make_legacy(self, content='{"k": 1}'):
         legacy = Path(self._legacy_path())
         legacy.parent.mkdir(parents=True, exist_ok=True)
-        legacy.write_text('{"k": 1}', encoding="utf-8")
+        legacy.write_text(content, encoding="utf-8")
+        return legacy
+
+    def test_migrates_legacy_into_owner_app_subdir(self):
+        legacy = self._make_legacy('{"k": 1}')
         target = self.root / "state-mig-1"
-        self.config._migrate_legacy_sessions(str(target), False)
+        self.config._migrate_legacy_sessions(self.OWNER, str(target), False)
         moved = target / "sessions.json"
         self.assertTrue(moved.is_file())
         self.assertEqual(moved.read_text(encoding="utf-8"), '{"k": 1}')
         self.assertFalse(legacy.exists())  # 已搬走
 
+    def test_no_migration_when_app_is_not_owner(self):
+        # 竞态根因守卫：非归属应用绝不认领旧文件
+        legacy = self._make_legacy('{"real": "history"}')
+        target = self.root / "state-mig-other"
+        self.config._migrate_legacy_sessions("cli_some_other_app", str(target), False)
+        self.assertFalse((target / "sessions.json").exists())
+        self.assertTrue(legacy.exists())  # 原位不动
+
     def test_no_migration_when_state_dir_explicit(self):
-        legacy = Path(self._legacy_path())
-        legacy.parent.mkdir(parents=True, exist_ok=True)
-        legacy.write_text("{}", encoding="utf-8")
+        legacy = self._make_legacy("{}")
         target = self.root / "state-mig-2"
-        self.config._migrate_legacy_sessions(str(target), True)  # explicit → 不动
+        self.config._migrate_legacy_sessions(self.OWNER, str(target), True)  # explicit → 不动
         self.assertFalse((target / "sessions.json").exists())
         self.assertTrue(legacy.exists())
 
     def test_does_not_overwrite_existing_target(self):
-        legacy = Path(self._legacy_path())
-        legacy.parent.mkdir(parents=True, exist_ok=True)
-        legacy.write_text('{"legacy": true}', encoding="utf-8")
+        legacy = self._make_legacy('{"legacy": true}')
         target = self.root / "state-mig-3"
         target.mkdir(parents=True, exist_ok=True)
         (target / "sessions.json").write_text('{"existing": true}', encoding="utf-8")
-        self.config._migrate_legacy_sessions(str(target), False)
+        self.config._migrate_legacy_sessions(self.OWNER, str(target), False)
         # 目标已有 → 不覆盖，旧文件保持原位
         self.assertEqual((target / "sessions.json").read_text(encoding="utf-8"), '{"existing": true}')
         self.assertTrue(legacy.exists())

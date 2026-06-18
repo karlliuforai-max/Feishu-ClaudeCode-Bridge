@@ -200,11 +200,27 @@ def _resolve_dirs(app_id: str, workdir_cfg, state_cfg) -> tuple[str, str]:
     return workdir, state
 
 
-def _migrate_legacy_sessions(state_dir: str, state_cfg_was_explicit: bool) -> None:
+def _legacy_owner_app_id() -> str | None:
+    """旧版顶层 ~/.feishu_bridge/sessions.json 由“单应用默认配置”（根目录 config.json）创建，
+    因此它的归属应用 = 根 config.json 的 app_id。读不到则返回 None。"""
+    root_cfg = os.path.join(BASE_DIR, "config.json")
+    try:
+        with open(root_cfg, encoding="utf-8") as f:
+            return json.load(f).get("app_id")
+    except (OSError, ValueError):
+        return None
+
+
+def _migrate_legacy_sessions(app_id: str, state_dir: str, state_cfg_was_explicit: bool) -> None:
     """一次性迁移：旧版单应用默认把 sessions.json 放在 ~/.feishu_bridge/ 顶层；现在默认带
-    app_id 子目录。仅当 state_dir 用默认、新位置还没有、而旧顶层文件存在时，搬进来，
-    避免升级后“丢上下文”。同盘 os.replace 原子移动。"""
+    app_id 子目录。仅当 state_dir 用默认、当前 app_id == 旧文件的归属应用（根 config.json 的
+    app_id）、新位置还没有、旧顶层文件存在时才搬进来。
+
+    按归属 app_id 门控是为了避免多应用同时首启的竞态——否则谁先启动谁就把这个共享的旧文件
+    move 走，导致原应用“丢上下文”、别的应用拿到不属于它的会话。同盘 os.replace 原子移动。"""
     if state_cfg_was_explicit:
+        return
+    if app_id != _legacy_owner_app_id():
         return
     legacy = _expand_path(os.path.join("~/.feishu_bridge", "sessions.json"))
     new = os.path.join(state_dir, "sessions.json")
@@ -261,8 +277,8 @@ ALLOWED_CHATS = set(_allow) if _allow else None
 # 启动期创建所有运行目录（含 workspace 与 inbox）
 for _d in (STATE_DIR, WORKDIR, INBOX_DIR):
     os.makedirs(_d, exist_ok=True)
-# 旧版顶层 sessions.json 一次性迁移到本应用的 state 子目录（须在 bridge 读 sessions 之前）
-_migrate_legacy_sessions(STATE_DIR, bool(_conf.get("state_dir")))
+# 旧版顶层 sessions.json 一次性迁移到归属应用的 state 子目录（须在 bridge 读 sessions 之前）
+_migrate_legacy_sessions(APP_ID, STATE_DIR, bool(_conf.get("state_dir")))
 
 
 # ---------- 每个 Agent 的静态配置 ----------

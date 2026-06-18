@@ -109,7 +109,7 @@ from config import (
     _ts,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 # 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
 START_TIME_MS = time.time() * 1000
 
@@ -1094,11 +1094,19 @@ def _clean_inbox() -> None:
 
 
 _dispatch = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message)
-# reaction 事件订阅了却没人处理会报 'processor not found'，注册空处理器消音
-if hasattr(_dispatch, "register_p2_im_message_reaction_created_v1"):
-    _dispatch = _dispatch.register_p2_im_message_reaction_created_v1(_ignore_event)
-if hasattr(_dispatch, "register_p2_im_message_reaction_deleted_v1"):
-    _dispatch = _dispatch.register_p2_im_message_reaction_deleted_v1(_ignore_event)
+# 这些事件一旦在飞书后台被订阅，没人处理就会刷 'processor not found' ERROR（无害但吵）。
+# 注册空处理器消音：表情回复、机器人/成员进出群等都不是本桥要处理的业务。
+for _ignored_event in (
+    "register_p2_im_message_reaction_created_v1",
+    "register_p2_im_message_reaction_deleted_v1",
+    "register_p2_im_chat_member_bot_added_v1",
+    "register_p2_im_chat_member_bot_deleted_v1",
+    "register_p2_im_chat_member_user_added_v1",
+    "register_p2_im_chat_member_user_deleted_v1",
+):
+    _register = getattr(_dispatch, _ignored_event, None)
+    if _register:
+        _dispatch = _register(_ignore_event)
 handler = _dispatch.build()
 
 if __name__ == "__main__":

@@ -9,6 +9,16 @@
 
 暂无
 
+## [0.4.1] - 2026-06-18
+
+### 修复
+
+- 修复多应用同时首启时的 sessions 迁移竞态：旧顶层 `~/.feishu_bridge/sessions.json` 现在**只被与根 `config.json` 同 `app_id` 的应用**认领，避免谁先启动谁就把共享旧文件搬走，导致原应用“丢上下文”、别的应用拿到不属于它的会话。
+
+### 变更
+
+- 为表情回复之外的「机器人/成员进出群」事件（`im.chat.member.bot.added/deleted`、`user.added/deleted`）注册空处理器，消除 lark `processor not found` 的 ERROR 噪音。
+
 ## [0.4.0] - 2026-06-18
 
 ### 新增
@@ -213,7 +223,8 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.1...v0.2.2
