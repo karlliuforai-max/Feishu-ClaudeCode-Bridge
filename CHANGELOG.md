@@ -9,6 +9,22 @@
 
 暂无
 
+## [0.4.0] - 2026-06-18
+
+### 新增
+
+- 支持同时接多个飞书应用，采用「一进程一应用」，各应用会话完全隔离。
+- 新增多应用监控启动器 `run_multi.py`（及 macOS 双击包装 `run_multi.command`）：自动发现 `configs/*.json`，每个 config 起一个独立 bridge 子进程，崩溃自动重启，日志按应用名前缀打印，Ctrl-C 统一停止。
+- 新增 `configs/` 目录约定（每个应用一份 config，`.gitignore` 忽略真实文件、保留 `configs/app-a.example.json` 示例）。
+
+### 变更
+
+- `state_dir` / `workdir` 未显式配置时，默认按 `app_id` 分目录：`~/.feishu_bridge/<app_id>/` 与 `<项目>/workspace/<app_id>/`，使多应用并行时 sessions.json 与 workspace/inbox 天然隔离。显式配置则按所写路径使用。
+
+### 迁移
+
+- 升级时一次性把旧的顶层 `~/.feishu_bridge/sessions.json` 自动搬入当前应用的 `<app_id>` 子目录（仅当 `state_dir` 用默认、新位置尚无文件时），现有单应用不丢上下文。
+
 ## [0.3.0] - 2026-06-18
 
 ### 变更
@@ -197,7 +213,8 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.0...v0.2.1

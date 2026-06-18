@@ -1,5 +1,8 @@
 # 含真实飞书密钥/本机路径，绝不上库
 config.json
+# 多应用：每个应用一份 config（含密钥），仅保留示例
+configs/*.json
+!configs/*.example.json
 __pycache__/
 *.pyc
 .pytest_cache/

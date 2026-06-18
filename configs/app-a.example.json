@@ -1,0 +1,11 @@
+{
+  "app_id": "cli_xxxxxxxxxxxx",
+  "app_secret": "xxxxxxxxxxxxxx",
+
+  "default_agent": "claude",
+  "model": "claude-sonnet-4-6",
+
+  "_说明": "每个飞书应用一份这样的 config，复制为 configs/<名字>.json（去掉 .example）。",
+  "_隔离": "不要设 state_dir / workdir：留空会自动按 app_id 分到 ~/.feishu_bridge/<app_id> 与 workspace/<app_id>，多应用天然隔离。",
+  "_其它可选字段": "其余字段（codex_*、claude_bin、timeout、stream_* 等）与 config.example.json 相同，按需添加。"
+}

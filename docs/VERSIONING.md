@@ -2,7 +2,7 @@
 
 本项目遵循语义化版本。
 
-当前版本是 `v0.3.0`。
+当前版本是 `v0.4.0`。
 
 ## 版本来源
 
@@ -15,7 +15,7 @@ src/feishu_agent_bridge.py
 当前变量：
 
 ```python
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 ```
 
 ## 发布策略
@@ -26,6 +26,8 @@ __version__ = "0.3.0"
 - Minor：向后兼容的新能力。
 - Major：配置、状态、命令或部署方式存在不兼容变更。
 
+v0.4.0 属于 Minor：它新增「多飞书应用并行」能力（一进程一应用 + `run_multi.py` 监控启动器），并把 `state_dir`/`workdir` 的默认目录改为按 `app_id` 分子目录以实现会话自动隔离；通过一次性迁移把旧顶层 `sessions.json` 搬入应用子目录，保证现有单应用不丢上下文。`/agent`、`/model`、飞书消息语义与 session 状态结构保持兼容。
+
 v0.3.0 属于 Minor：它把单文件拆成 `config.py` / `agents.py` / `feishu_agent_bridge.py` 三模块、把 agent 工作目录默认改到项目根下的 `workspace/`，并修复 Codex 启动崩溃；`/agent`、`/model`、飞书消息语义与 session 状态结构保持兼容。注意主文件已由 `feishu_claude_bridge.py` 改名为 `feishu_agent_bridge.py`，自定义启动方式需同步更新路径。
 
 v0.2.2 属于 Patch：它增强 CLI 自动发现和错误提示，并新增 Windows 双击启动脚本，不改变 `/agent` 行为、配置兼容性或状态结构。
@@ -33,6 +35,20 @@ v0.2.2 属于 Patch：它增强 CLI 自动发现和错误提示，并新增 Wind
 v0.2.1 属于 Patch：它修复 Windows 普通终端中 CLI 路径不可见导致的 Codex 启动问题，不改变 `/agent` 行为、配置兼容性或状态结构。
 
 v0.2.0 属于 Minor：它新增 Codex 后端和 `/agent` 切换，但保留现有 Claude 行为，并兼容旧配置与旧 session 状态。
+
+## v0.4.0 范围
+
+v0.4.0 包含：
+
+- 同时接多个飞书应用：一进程一应用，会话完全隔离。
+- `run_multi.py` 监控启动器 + `run_multi.command`，自动发现 `configs/*.json`、崩溃自重启。
+- `state_dir` / `workdir` 默认按 `app_id` 分目录；旧顶层 `sessions.json` 一次性迁移。
+
+v0.4.0 不包含：
+
+- 「单进程多应用」（多 ws.Client 同进程）——隔离更弱，不采用。
+- 改变 `/agent`、`/model`、飞书消息语义或 session 记录结构。
+- 把 `app_id` 编进 session key（隔离由每应用独立 sessions.json 保证）。
 
 ## v0.3.0 范围
 
