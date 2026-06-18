@@ -11,6 +11,10 @@ htmlcov/
 logs/
 .bridge_state/
 .claude/settings.local.json
+# agent 工作区：下载的附件与生成的文件都在这里，整目录不上库
+workspace/
 .inbox/
 # 测试用的个人证件等本地资料，勿上库
 营业执照.png
+feishu_img*.png
+feishu_img*.jpg

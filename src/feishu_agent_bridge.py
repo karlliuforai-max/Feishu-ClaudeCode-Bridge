@@ -1,41 +1,32 @@
 #!/usr/bin/env python3
 """
-feishu_claude_bridge.py
+feishu_agent_bridge.py
 
 飞书消息 <-> Claude Code / Codex 无头模式 Agent Gateway。
-大脑 = `claude -p` 或 `codex exec`（复用本机已登录 CLI）。
+大脑 = `claude -p` 或 `codex exec`（复用本机已登录 CLI，见 agents.py）。
 收发 = lark_oapi（飞书消息 encode/decode + WebSocket 长连接，断线自动重连）。
+
+模块分工（依赖链：config ← agents ← feishu_agent_bridge）：
+  - config.py   配置加载、运行目录(workspace/inbox/state)、各 Agent 静态配置
+  - agents.py   Agent 抽象与底层 CLI 调用（统一 run() 接口）
+  - 本文件      飞书 IM 收发、会话持久化与并发隔离、消息派发、进程入口
 
 自动行为：
   - 自动连接飞书并自动重连
-  - 私聊(P2P)：直接回复
-  - 群聊：仅当 @ 机器人时回复（避免刷屏）
+  - 私聊(P2P)：直接回复；群聊：仅当 @ 机器人时回复（避免刷屏）
   - /agent claude|codex：同一飞书会话内切换 Agent
-  - 收文本/图片/文件/富文本(post)：图片与文件自动下载到本地交给当前 Agent 查看处理
+  - 收文本/图片/文件/富文本(post)：图片与文件自动下载到 workspace/inbox 交给当前 Agent
   - 发图片：回复里写 <<<IMG>>>路径 或 ![](本地路径)，自动上传成飞书图片消息
-  - 每个会话和每个 Agent 独立维护 session，之后自动续接
-  - 持久化 session：chat 映射落盘 + Agent 会话 resume，重启不丢上下文
+  - 每个会话和每个 Agent 独立维护 session，之后自动续接；落盘持久化，重启不丢上下文
   - 多 session 并行隔离：不同会话独立进程；同会话加锁串行
-  - 命令：发送 /new 或 /reset 为当前 Agent 开启一个全新 session
+  - 命令：/new 或 /reset 开新 session；/model 临时切换 Claude 模型
 
-配置：默认读项目根目录的 config.json（不入库），字段见 README。
-  必填: app_id, app_secret
-  可选: default_agent / model(默认 claude-sonnet-4-6) / codex_model(gpt-5.5) /
-        codex_sandbox / codex_skip_git_repo_check / claude_bin / codex_bin /
-        workdir / state_dir / timeout /
-        max_attachment_bytes / stream_terminal / terminal_stream_format /
-        stream_reply / stream_reply_interval /
-        session_scope(chat_user|chat|user) / allowed_tools / allowed_chats
-  可用环境变量 BRIDGE_CONFIG 指定其它配置文件路径。
+配置：默认读项目根目录的 config.json（不入库），字段见 README 与 config.py。
+  必填: app_id, app_secret；可用环境变量 BRIDGE_CONFIG 指定其它配置文件路径。
 """
 import json
 import os
-import queue
 import re
-import shutil
-import subprocess
-import sys
-import tempfile
 import threading
 import time
 import urllib.request
@@ -95,192 +86,32 @@ except ModuleNotFoundError:
     ReplyMessageRequest = _MissingLarkRequest
     ReplyMessageRequestBody = _MissingLarkRequest
 
-__version__ = "0.2.2"
+from agents import get_agent
+from config import (
+    AGENT_CONFIGS,
+    ALLOWED_CHATS,
+    APP_ID,
+    APP_SECRET,
+    CLAUDE_MODEL,
+    CODEX_MODEL,
+    DEFAULT_AGENT,
+    INBOX_DIR,
+    MAX_ATTACHMENT_BYTES,
+    RESET_CMDS,
+    SESSION_SCOPE,
+    SESSIONS_FILE,
+    STREAM_REPLY,
+    STREAM_REPLY_INTERVAL,
+    VALID_AGENTS,
+    WORKDIR,
+    _normalize_agent,
+    _resolve_model,
+    _ts,
+)
+
+__version__ = "0.3.0"
 # 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
 START_TIME_MS = time.time() * 1000
-
-
-def _expand_path(path: str) -> str:
-    """展开配置里的 ~ 和环境变量，并转成绝对路径。"""
-    raw = str(path)
-    if raw == "~" or raw.startswith(("~/", "~\\")):
-        home = os.environ.get("HOME")
-        if home:
-            rest = raw[2:] if len(raw) > 1 else ""
-            raw = os.path.join(home, rest)
-    return os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))
-
-
-def _common_cli_candidates(command: str) -> list[str]:
-    command = command.strip()
-    if os.name != "nt" or command not in {"claude", "codex"}:
-        return []
-
-    candidates: list[str] = []
-    appdata = os.environ.get("APPDATA", "")
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    userprofile = os.environ.get("USERPROFILE", "")
-
-    if appdata:
-        npm_dir = os.path.join(appdata, "npm")
-        candidates += [
-            os.path.join(npm_dir, f"{command}.cmd"),
-            os.path.join(npm_dir, f"{command}.exe"),
-            os.path.join(npm_dir, command),
-        ]
-
-    if command == "claude":
-        if userprofile:
-            candidates += [
-                os.path.join(userprofile, ".claude", "local", "claude.cmd"),
-                os.path.join(userprofile, ".claude", "local", "claude.exe"),
-            ]
-        if localappdata:
-            candidates += [
-                os.path.join(localappdata, "claude-cli-nodejs", "claude.cmd"),
-                os.path.join(localappdata, "claude-cli-nodejs", "claude.exe"),
-            ]
-    elif command == "codex" and userprofile:
-        ext_root = os.path.join(userprofile, ".vscode", "extensions")
-        if os.path.isdir(ext_root):
-            try:
-                for name in os.listdir(ext_root):
-                    if name.startswith("openai.chatgpt-"):
-                        candidates.append(os.path.join(
-                            ext_root, name, "bin", "windows-x86_64", "codex.exe"
-                        ))
-            except OSError:
-                pass
-
-    return candidates
-
-
-def _cli_bin(value, default: str) -> str:
-    raw = str(value or default).strip() or default
-    expanded = os.path.expandvars(os.path.expanduser(raw))
-    if (
-        raw == "~"
-        or raw.startswith(("~/", "~\\"))
-        or os.path.isabs(expanded)
-        or "/" in raw
-        or "\\" in raw
-    ):
-        return os.path.abspath(expanded)
-    found = shutil.which(expanded)
-    if found:
-        return found
-    for candidate in _common_cli_candidates(expanded):
-        if os.path.isfile(candidate):
-            return candidate
-    return expanded
-
-
-def _cli_missing_message(agent_name: str, configured_bin: str, config_key: str) -> str:
-    return (
-        f"❌ 找不到 {agent_name} CLI：{configured_bin}\n"
-        f"请先安装并登录 {agent_name} CLI，或在 config.json 中配置 `{config_key}` 为可执行文件绝对路径。"
-    )
-
-
-def _as_bool(value, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return default
-
-
-# ---------- 配置 ----------
-# 所有可变项集中在项目根目录的 config.json（不入库，见 README「配置」）。
-# 只有 app_id / app_secret 必填，其余缺省即可。可用 BRIDGE_CONFIG 指定别的路径。
-SRC_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.dirname(SRC_DIR)
-CONFIG_FILE = _expand_path(os.environ.get("BRIDGE_CONFIG", os.path.join(BASE_DIR, "config.json")))
-try:
-    with open(CONFIG_FILE, encoding="utf-8") as _f:
-        _conf = json.load(_f)
-except FileNotFoundError:
-    raise SystemExit(
-        f"❌ 缺少配置文件: {CONFIG_FILE}\n"
-        f'   请按 README 创建，至少包含飞书应用凭证：\n'
-        f'   {{"app_id": "cli_xxx", "app_secret": "xxxxxx"}}'
-    )
-
-# 飞书应用凭证（必填）
-APP_ID = _conf["app_id"]
-APP_SECRET = _conf["app_secret"]
-
-# 以下均可选：config.json 没写就用默认值
-# Agent 选择：默认继续走 Claude；同一飞书会话可用 /agent 切换到 Codex。
-VALID_AGENTS = {"claude", "codex"}
-DEFAULT_AGENT = str(_conf.get("default_agent", "claude")).strip().lower()
-if DEFAULT_AGENT not in VALID_AGENTS:
-    raise SystemExit("❌ 配置错误: default_agent 只能是 claude 或 codex")
-
-# claude -p 使用的默认模型 ID
-CLAUDE_MODEL = _conf.get("model", "claude-sonnet-4-6")
-# Codex 固定单模型，避免与 Claude 的 /model 体系混在一起。
-CODEX_MODEL = str(_conf.get("codex_model", "gpt-5.5")).strip()
-if CODEX_MODEL != "gpt-5.5":
-    raise SystemExit("❌ 配置错误: 当前版本的 codex_model 只能是 gpt-5.5")
-CODEX_SANDBOX = str(_conf.get("codex_sandbox", "workspace-write")).strip() or "workspace-write"
-CODEX_SKIP_GIT_REPO_CHECK = _as_bool(_conf.get("codex_skip_git_repo_check"), True)
-CLAUDE_BIN = _cli_bin(_conf.get("claude_bin"), "claude")
-CODEX_BIN = _cli_bin(_conf.get("codex_bin"), "codex")
-# 模型短名 → 完整 model ID，临时切换时少打字（也可直接传完整 ID）
-MODEL_ALIASES = {
-    "opus": "claude-opus-4-8",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
-    "fable": "claude-fable-5",
-}
-# 会话级临时模型覆盖：/model <name> 设置、/model reset 清除；仅存内存，重启即失效
-_SESSION_MODELS: dict[str, str] = {}
-# claude 固定运行目录（决定会话上下文/CLAUDE.md 归属），默认脚本所在目录
-WORKDIR = _expand_path(_conf.get("workdir") or BASE_DIR)
-# session 持久化目录
-STATE_DIR = _expand_path(_conf.get("state_dir") or "~/.feishu_bridge")
-SESSIONS_FILE = os.path.join(STATE_DIR, "sessions.json")
-# 用户发来的图片/文件下载到这里，处理完即删。
-# 放在 WORKDIR 下（而非 STATE_DIR）：claude -p 以 WORKDIR 为工作目录，
-# 沙箱通常只允许读工作目录内的文件，放这里才能被 Read 工具读到。
-INBOX_DIR = os.path.join(WORKDIR, ".inbox")
-CLAUDE_TIMEOUT = int(_conf.get("timeout", 600))
-MAX_ATTACHMENT_BYTES = int(_conf.get("max_attachment_bytes", 25 * 1024 * 1024))
-if MAX_ATTACHMENT_BYTES <= 0:
-    raise SystemExit("❌ 配置错误: max_attachment_bytes 必须大于 0")
-STREAM_TERMINAL = _as_bool(_conf.get("stream_terminal"), True)
-TERMINAL_STREAM_FORMAT = str(_conf.get("terminal_stream_format", "text")).strip().lower()
-if TERMINAL_STREAM_FORMAT not in {"text", "json"}:
-    raise SystemExit("❌ 配置错误: terminal_stream_format 只能是 text 或 json")
-# 流式回复：开启后用飞书 CardKit 流式卡片「边生成边更新」，让用户实时看到 Claude 打字。
-# 默认关闭：保留稳妥的「生成完一次性回复」路径作为兜底，任一环节失败都会自动退回普通回复。
-# 开启时会强制使用 stream-json 以获取增量文本（与 terminal_stream_format 无关）。
-STREAM_REPLY = _as_bool(_conf.get("stream_reply"), False)
-# 卡片最小刷新间隔（秒）。飞书 CardKit 文本更新限频 50 次/秒、1000 次/分，默认 0.7s 足够稳。
-STREAM_REPLY_INTERVAL = float(_conf.get("stream_reply_interval", 0.7))
-# 会话作用域：
-#   chat_user(默认) 群里按“群+人”分 session：同群不同人各自独立、并行执行
-#   chat            整个群共用一个 session（群内串行、共享上下文）
-#   user            按人分，不区分群/私聊（同一人的群与私聊会并成一个上下文）
-SESSION_SCOPE = _conf.get("session_scope", "chat_user")
-# 预授权工具，避免无头模式卡在看不见的授权框。可在 config.json 里写字符串或数组。
-# 默认不含 Bash：从能力上断掉 Claude 自己 curl 飞书 API 发消息（这是“发错群”的根因）。
-# 发送只由桥经 reply_to(原消息) 完成，永远回到来源会话。
-_tools = _conf.get("allowed_tools",
-                   "Read Write Edit Glob Grep WebSearch WebFetch Skill TodoWrite Task")
-ALLOWED_TOOLS = _tools.split() if isinstance(_tools, str) else list(_tools)
-RESET_CMDS = {"/new", "/reset", "/新会话", "新会话", "重置会话"}
-os.makedirs(STATE_DIR, exist_ok=True)
-os.makedirs(INBOX_DIR, exist_ok=True)
-
-# 群白名单：config.json 的 allowed_chats(数组)；空/缺省=对所有会话响应
-_allow = _conf.get("allowed_chats")
-ALLOWED_CHATS = set(_allow) if _allow else None
 
 client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
 _MENTION_RE = re.compile(r"@_user_\d+")
@@ -288,6 +119,9 @@ _BOT_OPEN_ID: str | None = None
 _BOT_OPEN_ID_RETRY_SECONDS = 60
 _BOT_OPEN_ID_LAST_ATTEMPT = -_BOT_OPEN_ID_RETRY_SECONDS
 _BOT_OPEN_ID_LOCK = threading.Lock()
+
+# 会话级临时模型覆盖：/model <name> 设置、/model reset 清除；仅存内存，重启即失效
+_SESSION_MODELS: dict[str, str] = {}
 
 
 def _get_bot_open_id() -> str | None:
@@ -326,6 +160,7 @@ def _get_bot_open_id_cached() -> str | None:
         _BOT_OPEN_ID = _get_bot_open_id()
         return _BOT_OPEN_ID
 
+
 # ---------- session 持久化 + 并发隔离 ----------
 _sessions_guard = threading.Lock()
 _keylocks_guard = threading.Lock()
@@ -334,11 +169,6 @@ _keylocks: dict[str, threading.Lock] = {}
 _DEDUP: dict[str, float] = {}
 _DEDUP_LOCK = threading.Lock()
 _DEDUP_TTL = 30  # 秒
-
-
-def _ts() -> str:
-    """本地时间 HH:MM:SS，用于终端对话日志。"""
-    return time.strftime("%H:%M:%S")
 
 
 def _seen_recently(message_id: str) -> bool:
@@ -381,7 +211,7 @@ SESSIONS = _load_sessions()
 
 def _save_sessions() -> None:
     tmp = SESSIONS_FILE + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(SESSIONS, f, ensure_ascii=False, indent=2)
     os.replace(tmp, SESSIONS_FILE)
 
@@ -392,11 +222,6 @@ def _key_lock(key: str) -> threading.Lock:
         if lk is None:
             lk = _keylocks[key] = threading.Lock()
         return lk
-
-
-def _normalize_agent(name: str | None) -> str:
-    agent = (name or DEFAULT_AGENT).strip().lower()
-    return agent if agent in VALID_AGENTS else DEFAULT_AGENT
 
 
 def _normalize_session_record(rec) -> tuple[dict, bool]:
@@ -529,10 +354,6 @@ def _reset_agent_session(key: str, agent: str | None = None,
     return active
 
 
-def _reset_session(key: str) -> None:
-    _reset_agent_session(key)
-
-
 def _get_or_create_agent_sid(key: str, agent: str, chat_id: str = "",
                              chat_type: str = "") -> tuple[str, bool]:
     agent = _normalize_agent(agent)
@@ -546,23 +367,20 @@ def _get_or_create_agent_sid(key: str, agent: str, chat_id: str = "",
     return sid, True
 
 
-def _get_or_create_sid(key: str, chat_id: str = "", chat_type: str = "") -> tuple[str, bool]:
-    return _get_or_create_agent_sid(key, "claude", chat_id, chat_type)
-
-
+# ---------- Agent 状态/模型展示 ----------
 def _agent_model(agent: str, key: str = "", override: str = "") -> str:
-    agent = _normalize_agent(agent)
-    if agent == "codex":
-        return CODEX_MODEL
-    return override or _SESSION_MODELS.get(key, "") or CLAUDE_MODEL
+    cfg = AGENT_CONFIGS[_normalize_agent(agent)]
+    if not cfg.supports_model_switch:
+        return cfg.default_model
+    return override or _SESSION_MODELS.get(key, "") or cfg.default_model
 
 
 def _agent_display_name(agent: str) -> str:
-    return "Codex" if _normalize_agent(agent) == "codex" else "Claude"
+    return AGENT_CONFIGS[_normalize_agent(agent)].display_name
 
 
 def _agent_supports_stream_reply(agent: str) -> bool:
-    return _normalize_agent(agent) == "claude"
+    return AGENT_CONFIGS[_normalize_agent(agent)].supports_stream_reply
 
 
 def _format_agent_status(key: str, chat_id: str = "", chat_type: str = "") -> str:
@@ -573,8 +391,8 @@ def _format_agent_status(key: str, chat_id: str = "", chat_type: str = "") -> st
         f"当前模型：{model}",
         "可用命令：/agent claude、/agent codex、/agent reset",
     ]
-    if agent == "codex":
-        lines.append("Codex 固定使用 gpt-5.5，不支持 /model 切换。")
+    if not AGENT_CONFIGS[_normalize_agent(agent)].supports_model_switch:
+        lines.append(f"{_agent_display_name(agent)} 固定使用 {model}，不支持 /model 切换。")
     return "\n".join(lines)
 
 
@@ -595,7 +413,7 @@ def _is_slash_command(text: str, command: str) -> bool:
     return text == command or text.startswith(command + " ")
 
 
-# ---------- tenant token 缓存（供 urllib patch 使用）----------
+# ---------- tenant token 缓存 ----------
 _TOKEN_CACHE: dict = {"token": "", "exp": 0.0}
 _TOKEN_LOCK = threading.Lock()
 
@@ -676,630 +494,6 @@ def _del_reaction(message_id: str, reaction_id: str) -> None:
         print(f"[reaction del error] {e}")
 
 
-def _resolve_model(name: str) -> str | None:
-    """把用户输入解析成完整 model ID：支持短名(opus/sonnet/haiku/fable)或直接传完整 ID。
-    无法识别返回 None。"""
-    n = (name or "").strip()
-    if not n:
-        return None
-    low = n.lower()
-    if low in MODEL_ALIASES:
-        return MODEL_ALIASES[low]
-    if low.startswith("claude-"):  # 直接给完整 model ID
-        return n
-    return None
-
-
-def _build_claude_cmd(text: str, sid: str, is_new: bool, output_format: str = "text",
-                      model: str = "") -> list[str]:
-    flag = "--session-id" if is_new else "--resume"
-    cmd = [CLAUDE_BIN, "-p", text, flag, sid, "--output-format", output_format,
-           "--model", model or CLAUDE_MODEL]
-    if output_format == "stream-json":
-        cmd += ["--verbose", "--include-partial-messages", "--include-hook-events"]
-    if ALLOWED_TOOLS:
-        cmd += ["--allowedTools", *ALLOWED_TOOLS]
-    return cmd
-
-
-def _fallback_no_output(stderr: str) -> str:
-    return "(claude 无输出) " + (stderr or "")[:300]
-
-
-def _run_claude_buffered(cmd: list[str]) -> str:
-    r = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=CLAUDE_TIMEOUT, cwd=WORKDIR, stdin=subprocess.DEVNULL
-    )
-    out = (r.stdout or "").strip()
-    return out or _fallback_no_output(r.stderr or "")
-
-
-def _pipe_to_queue(pipe, stream_name: str, out_q: "queue.Queue[tuple[str, str]]", by_line: bool) -> None:
-    try:
-        try:
-            if by_line:
-                for chunk in iter(pipe.readline, ""):
-                    out_q.put((stream_name, chunk))
-            else:
-                while True:
-                    chunk = pipe.read(1)
-                    if not chunk:
-                        break
-                    out_q.put((stream_name, chunk))
-        except UnicodeDecodeError as e:
-            out_q.put((stream_name, f"[decode error] {e}\n"))
-    finally:
-        try:
-            pipe.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _short_json(value, limit: int = 600) -> str:
-    try:
-        text = json.dumps(value, ensure_ascii=False)
-    except TypeError:
-        text = str(value)
-    return text if len(text) <= limit else text[:limit] + "..."
-
-
-def _extract_text_from_content(content) -> str:
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") == "text" and isinstance(item.get("text"), str):
-            parts.append(item["text"])
-        delta = item.get("delta")
-        if isinstance(delta, dict) and isinstance(delta.get("text"), str):
-            parts.append(delta["text"])
-    return "".join(parts)
-
-
-def _truncate(value, limit: int = 200) -> str:
-    s = value if isinstance(value, str) else str(value)
-    s = s.replace("\n", " ").strip()
-    return s if len(s) <= limit else s[:limit] + "…"
-
-
-# 常见工具 → 最能说明「这步在干嘛」的输入字段。其余工具回退到压缩后的 JSON。
-_TOOL_SUMMARY_KEY = {
-    "Read": "file_path", "Write": "file_path", "Edit": "file_path",
-    "MultiEdit": "file_path", "NotebookEdit": "notebook_path",
-    "Bash": "command", "Grep": "pattern", "Glob": "pattern",
-    "Task": "description",
-}
-
-
-def _summarize_tool(name: str, tool_input) -> str:
-    """把一次工具调用压成一行人能看懂的摘要：Read 显示文件、Bash 显示命令等。"""
-    i = tool_input if isinstance(tool_input, dict) else {}
-    key = _TOOL_SUMMARY_KEY.get(name)
-    if key and i.get(key):
-        return _truncate(i[key])
-    if name in {"WebFetch", "WebSearch"}:
-        return _truncate(i.get("url") or i.get("query") or "")
-    if name == "Skill":
-        return _truncate(i.get("command") or i.get("skill") or "")
-    if name == "TodoWrite":
-        todos = i.get("todos")
-        return f"{len(todos)} 项待办" if isinstance(todos, list) else ""
-    return _truncate(_short_json(i, 200))
-
-
-def _collapse(text: str, max_lines: int = 4, max_chars: int = 500) -> str:
-    """长工具结果折叠：只留前几行/若干字符，带「│」缩进前缀，超出给出统计提示。"""
-    text = (text or "").strip()
-    if not text:
-        return ""
-    full_len = len(text)
-    lines = text.splitlines()
-    clipped = len(lines) > max_lines
-    lines = lines[:max_lines]
-    body = "\n".join(lines)
-    if len(body) > max_chars:
-        body = body[:max_chars]
-        clipped = True
-    out = "\n".join("    │ " + ln for ln in body.splitlines())
-    if clipped:
-        out += f"\n    │ …（共 {full_len} 字，已折叠）"
-    return out
-
-
-class _StreamJsonRenderer:
-    """消费 claude `--output-format stream-json` 的事件流。
-
-    职责：
-      1) 把事件渲染成统一时间线打到终端（system / 工具调用 / 工具结果 / 文本 / result）；
-      2) 实时把助手文本增量通过 on_text_delta 回调出去（供流式卡片）；
-      3) 汇总最终回复文本（final_text，以 result 事件为准，缺失时回退增量/整段）。
-    """
-
-    def __init__(self, tag: str = "", echo: bool = True, on_text_delta=None):
-        self.tag = tag
-        self.echo = echo
-        self.on_text_delta = on_text_delta
-        self.tools: dict[str, dict] = {}     # tool_use_id -> {name, summary, t0}
-        self.final_result = ""
-        self.delta_parts: list[str] = []
-        self.assistant_parts: list[str] = []
-        self.had_delta = False               # 当前助手轮是否已经流过增量，避免整段重复
-        self.error = False
-
-    # ---- 终端输出小工具 ----
-    def _prefix(self) -> str:
-        return f"[{self.tag}] " if self.tag else ""
-
-    def _line(self, text: str) -> None:
-        if self.echo:
-            print(self._prefix() + text, flush=True)
-
-    def _raw(self, text: str) -> None:
-        if self.echo:
-            sys.stdout.write(text)
-            sys.stdout.flush()
-
-    def _push_text(self, text: str) -> None:
-        if not text:
-            return
-        if self.on_text_delta:
-            try:
-                self.on_text_delta(text)
-            except Exception as e:  # noqa: BLE001
-                print(f"[stream-reply error] {e}")
-
-    # ---- 事件分发 ----
-    def feed(self, line: str) -> None:
-        raw = line.strip()
-        if not raw:
-            return
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError:
-            self._line(f"[raw] {_truncate(raw, 300)}")
-            return
-        if not isinstance(event, dict):
-            return
-        etype = str(event.get("type") or event.get("event") or "event")
-        if etype == "stream_event":  # --include-partial-messages 包了一层
-            self._on_partial(event.get("event"))
-            return
-        handler = getattr(self, f"_on_{etype}", None)
-        if handler:
-            handler(event)
-        elif etype in {"content_block_delta", "message_delta"}:
-            self._on_partial(event)
-        else:
-            self._line(f"[{etype}] {_short_json(event, 200)}")
-
-    def _on_partial(self, ev) -> None:
-        if not isinstance(ev, dict):
-            return
-        if ev.get("type") == "content_block_delta":
-            delta = ev.get("delta") or {}
-            text = delta.get("text") or ""   # thinking_delta 没有 text 字段，天然跳过
-            if text:
-                self.had_delta = True
-                self.delta_parts.append(text)
-                self._raw(text)
-                self._push_text(text)
-
-    def _on_system(self, event) -> None:
-        sub = event.get("subtype")
-        # thinking_tokens 是模型内部思考过程的增量事件，对终端阅读零价值，
-        # 只会刷出几十上百行噪音。直接跳过，仅保留有意义的系统事件。
-        if sub == "thinking_tokens":
-            return
-        model = event.get("model") or ""
-        bits = [b for b in [f"subtype={sub}" if sub else "", f"model={model}" if model else ""] if b]
-        self._line("[system] " + (" ".join(bits) or _short_json(event, 200)))
-
-    def _on_assistant(self, event) -> None:
-        message = event.get("message") if isinstance(event.get("message"), dict) else event
-        content = message.get("content")
-        if isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "tool_use":
-                    tid = item.get("id") or ""
-                    name = item.get("name") or item.get("tool_name") or "tool"
-                    summary = _summarize_tool(name, item.get("input"))
-                    self.tools[tid] = {"name": name, "summary": summary, "t0": time.monotonic()}
-                    self._line(f"[tool ▶] {name}  {summary}".rstrip())
-        text = _extract_text_from_content(content)
-        if text:
-            self.assistant_parts.append(text)
-            if not self.had_delta:  # 没有增量流（理论上不会，但兜底）→ 整段打印+推送一次
-                self._raw(text + ("" if text.endswith("\n") else "\n"))
-                self._push_text(text)
-        self.had_delta = False  # 该助手块结束，下一块重新计
-
-    def _on_user(self, event) -> None:
-        message = event.get("message") if isinstance(event.get("message"), dict) else event
-        content = message.get("content")
-        if isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "tool_result":
-                    self._render_tool_result(item)
-
-    def _render_tool_result(self, item: dict) -> None:
-        tid = item.get("tool_use_id") or ""
-        info = self.tools.pop(tid, None)
-        name = info["name"] if info else "tool"
-        dur = f" {time.monotonic() - info['t0']:.1f}s" if info and info.get("t0") else ""
-        is_err = bool(item.get("is_error"))
-        head = f"[tool {'✗' if is_err else '✓'}{dur}] {name}"
-        self._line(("⚠️ " + head) if is_err else head)
-        body = _collapse(_extract_text_from_content(item.get("content")))
-        if body and self.echo:
-            print(body, flush=True)
-        if is_err:
-            self.error = True
-
-    def _on_result(self, event) -> None:
-        sub = event.get("subtype")
-        dur = event.get("duration_ms")
-        cost = event.get("total_cost_usd")
-        res = event.get("result")
-        if isinstance(res, str):
-            self.final_result = res
-        if sub and sub != "success":
-            self.error = True
-        bits = [b for b in [
-            f"subtype={sub}" if sub else "",
-            f"{dur}ms" if dur is not None else "",
-            f"${cost}" if cost is not None else "",
-        ] if b]
-        mark = "⚠️ " if self.error else ""
-        self._line(f"\n{mark}[result] " + " ".join(bits))
-
-    @property
-    def final_text(self) -> str:
-        return (self.final_result or "".join(self.delta_parts)
-                or "".join(self.assistant_parts)).strip()
-
-
-def _run_claude_streaming(cmd: list[str], stream_format: str, tag: str = "",
-                          text_delta_cb=None, terminal_echo: bool = True) -> str:
-    by_line = stream_format == "json"
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=WORKDIR,
-        bufsize=1,
-    )
-    out_q: "queue.Queue[tuple[str, str]]" = queue.Queue()
-    threads = [
-        threading.Thread(target=_pipe_to_queue, args=(proc.stdout, "stdout", out_q, by_line), daemon=True),
-        threading.Thread(target=_pipe_to_queue, args=(proc.stderr, "stderr", out_q, by_line), daemon=True),
-    ]
-    for t in threads:
-        t.start()
-
-    renderer = (_StreamJsonRenderer(tag=tag, echo=terminal_echo, on_text_delta=text_delta_cb)
-                if stream_format == "json" else None)
-    stdout_chunks: list[str] = []
-    stderr_chunks: list[str] = []
-    deadline = time.monotonic() + CLAUDE_TIMEOUT
-    timed_out = False
-
-    while True:
-        try:
-            stream_name, chunk = out_q.get(timeout=0.1)
-        except queue.Empty:
-            stream_name = chunk = ""
-
-        if chunk:
-            if stream_name == "stderr":
-                stderr_chunks.append(chunk)
-                if terminal_echo:
-                    sys.stderr.write(chunk)
-                    sys.stderr.flush()
-            elif renderer is not None:
-                renderer.feed(chunk)
-            else:
-                stdout_chunks.append(chunk)
-                if terminal_echo:
-                    print(chunk, end="", flush=True)
-                if text_delta_cb:  # text 档也支持流式回复：逐块推送
-                    try:
-                        text_delta_cb(chunk)
-                    except Exception as e:  # noqa: BLE001
-                        print(f"[stream-reply error] {e}")
-
-        if proc.poll() is not None and out_q.empty() and all(not t.is_alive() for t in threads):
-            break
-        if time.monotonic() > deadline:
-            timed_out = True
-            proc.kill()
-            break
-
-    for t in threads:
-        t.join(timeout=1)
-
-    if timed_out:
-        raise subprocess.TimeoutExpired(cmd, CLAUDE_TIMEOUT)
-
-    if terminal_echo:
-        print(f"\n[{_ts()}] ■ Claude 流结束 [{tag}]", flush=True)
-    out = renderer.final_text if renderer is not None else "".join(stdout_chunks).strip()
-    return out or _fallback_no_output("".join(stderr_chunks))
-
-
-def ask_claude(key: str, text: str, chat_id: str = "", chat_type: str = "",
-               text_delta_cb=None, model: str = "") -> str:
-    sid, is_new = _get_or_create_sid(key, chat_id, chat_type)
-    # 模型优先级：单条覆盖(model) > 会话级覆盖 > 全局默认
-    eff_model = model or _SESSION_MODELS.get(key) or CLAUDE_MODEL
-    # 终端 json 档 或 流式回复 都需要 stream-json（前者要结构化事件，后者要增量文本）
-    want_json = (STREAM_TERMINAL and TERMINAL_STREAM_FORMAT == "json") or (text_delta_cb is not None)
-    output_format = "stream-json" if want_json else "text"
-    cmd = _build_claude_cmd(text, sid, is_new, output_format, eff_model)
-    tag = sid[:8]
-    try:
-        if STREAM_TERMINAL or text_delta_cb:
-            return _run_claude_streaming(
-                cmd, "json" if want_json else "text",
-                tag=tag, text_delta_cb=text_delta_cb, terminal_echo=STREAM_TERMINAL,
-            )
-        return _run_claude_buffered(cmd)
-    except subprocess.TimeoutExpired:
-        return "⌛ 处理超时了，换个更具体的问题再试。"
-    except FileNotFoundError:
-        return _cli_missing_message("Claude", CLAUDE_BIN, "claude_bin")
-    except Exception as e:  # noqa: BLE001
-        return f"❌ 处理出错：{e}"
-
-
-def _build_codex_cmd(text: str, sid: str | None, output_file: str,
-                     model: str = "") -> list[str]:
-    model = model or CODEX_MODEL
-    if sid:
-        cmd = [
-            CODEX_BIN, "exec", "resume",
-            "--json",
-            "--output-last-message", output_file,
-            "--model", model,
-        ]
-        if CODEX_SKIP_GIT_REPO_CHECK:
-            cmd.append("--skip-git-repo-check")
-        cmd += [sid, "-"]
-        return cmd
-
-    cmd = [
-        CODEX_BIN, "exec",
-        "--json",
-        "--output-last-message", output_file,
-        "--model", model,
-        "--cd", WORKDIR,
-        "--sandbox", CODEX_SANDBOX,
-    ]
-    if CODEX_SKIP_GIT_REPO_CHECK:
-        cmd.append("--skip-git-repo-check")
-    cmd.append("-")
-    return cmd
-
-
-def _extract_codex_session_id(value) -> str | None:
-    if isinstance(value, dict):
-        for key in ("session_id", "conversation_id", "thread_id"):
-            val = value.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-        for val in value.values():
-            found = _extract_codex_session_id(val)
-            if found:
-                return found
-    elif isinstance(value, list):
-        for item in value:
-            found = _extract_codex_session_id(item)
-            if found:
-                return found
-    return None
-
-
-def _codex_event_text(event: dict) -> str:
-    etype = str(event.get("type") or event.get("event") or "event")
-    if etype == "item.completed":
-        item = event.get("item") if isinstance(event.get("item"), dict) else {}
-        itype = item.get("type") or "item"
-        text = item.get("text")
-        if isinstance(text, str) and text:
-            return f"[codex {itype}] {_truncate(text, 300)}"
-        return f"[codex {itype}]"
-    if etype in {"assistant_message", "agent_message", "message"}:
-        text = event.get("message") or event.get("text") or event.get("content") or ""
-        if isinstance(text, str):
-            return f"[codex {etype}] {_truncate(text, 300)}"
-    if etype in {"error", "turn_failed"}:
-        return f"⚠️ [codex {etype}] {_short_json(event, 300)}"
-    if etype in {"session", "session_created", "turn_started", "turn_completed", "result"}:
-        return f"[codex {etype}] {_short_json(event, 220)}"
-    return f"[codex {etype}]"
-
-
-def _extract_codex_agent_text(event: dict) -> str:
-    etype = str(event.get("type") or event.get("event") or "")
-    if etype == "item.completed":
-        item = event.get("item") if isinstance(event.get("item"), dict) else {}
-        if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
-            return item["text"]
-    if etype in {"assistant_message", "agent_message", "message"}:
-        text = event.get("message") or event.get("text") or event.get("content")
-        return text if isinstance(text, str) else ""
-    return ""
-
-
-def _extract_codex_error(event: dict) -> str:
-    etype = str(event.get("type") or event.get("event") or "")
-    if etype == "error":
-        msg = event.get("message")
-        return msg if isinstance(msg, str) else _short_json(event, 300)
-    if etype == "turn.failed":
-        err = event.get("error")
-        if isinstance(err, dict) and isinstance(err.get("message"), str):
-            return err["message"]
-        return _short_json(event, 300)
-    return ""
-
-
-def _clean_codex_final_text(text: str) -> str:
-    lines = []
-    for line in (text or "").splitlines():
-        stripped = line.strip()
-        if stripped == "Reading additional input from stdin...":
-            continue
-        if re.match(r"^\d{4}-\d{2}-\d{2}T.*\sERROR\s", stripped):
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
-
-
-def _run_codex_streaming(cmd: list[str], output_file: str, tag: str = "",
-                         input_text: str = "") -> tuple[str, str | None]:
-    if STREAM_TERMINAL:
-        print(f"[{_ts()}] ▶ Codex 开始 [{tag or 'new'}]", flush=True)
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=WORKDIR,
-        bufsize=1,
-    )
-    if terminal_echo:
-        print(f"[{_ts()}] ▶ Claude 流开始 [{tag}]（format={stream_format}）", flush=True)
-    try:
-        proc.stdin.write(input_text or "")
-        proc.stdin.close()
-    except Exception as e:  # noqa: BLE001
-        print(f"[codex stdin error] {e}")
-    out_q: "queue.Queue[tuple[str, str]]" = queue.Queue()
-    threads = [
-        threading.Thread(target=_pipe_to_queue, args=(proc.stdout, "stdout", out_q, True), daemon=True),
-        threading.Thread(target=_pipe_to_queue, args=(proc.stderr, "stderr", out_q, True), daemon=True),
-    ]
-    for t in threads:
-        t.start()
-
-    stdout_lines: list[str] = []
-    stderr_chunks: list[str] = []
-    agent_text_parts: list[str] = []
-    error_messages: list[str] = []
-    failed = False
-    session_id = None
-    deadline = time.monotonic() + CLAUDE_TIMEOUT
-    timed_out = False
-
-    while True:
-        try:
-            stream_name, chunk = out_q.get(timeout=0.1)
-        except queue.Empty:
-            stream_name = chunk = ""
-
-        if chunk:
-            if stream_name == "stderr":
-                stderr_chunks.append(chunk)
-                if STREAM_TERMINAL:
-                    sys.stderr.write(chunk)
-                    sys.stderr.flush()
-            else:
-                stdout_lines.append(chunk)
-                raw = chunk.strip()
-                try:
-                    event = json.loads(raw)
-                except json.JSONDecodeError:
-                    if STREAM_TERMINAL and raw:
-                        print(f"[codex raw] {_truncate(raw, 300)}", flush=True)
-                else:
-                    session_id = session_id or _extract_codex_session_id(event)
-                    agent_text = _extract_codex_agent_text(event)
-                    if agent_text:
-                        agent_text_parts.append(agent_text)
-                    err = _extract_codex_error(event)
-                    if err:
-                        error_messages.append(err)
-                    if str(event.get("type") or event.get("event") or "") == "turn.failed":
-                        failed = True
-                    if STREAM_TERMINAL:
-                        print(_codex_event_text(event), flush=True)
-
-        if proc.poll() is not None and out_q.empty() and all(not t.is_alive() for t in threads):
-            break
-        if time.monotonic() > deadline:
-            timed_out = True
-            proc.kill()
-            break
-
-    for t in threads:
-        t.join(timeout=1)
-
-    if timed_out:
-        raise subprocess.TimeoutExpired(cmd, CLAUDE_TIMEOUT)
-
-    try:
-        with open(output_file, encoding="utf-8") as f:
-            final_text = _clean_codex_final_text(f.read())
-    except OSError:
-        final_text = ""
-
-    if STREAM_TERMINAL:
-        print(f"\n[{_ts()}] ■ Codex 结束 [{tag or (session_id or 'new')[:8]}]", flush=True)
-    if failed:
-        msg = error_messages[-1] if error_messages else "未知错误"
-        return f"❌ Codex 处理失败：{msg}", session_id
-    if not final_text and agent_text_parts:
-        final_text = "\n".join(agent_text_parts).strip()
-    fallback = "".join(stdout_lines).strip() or "".join(stderr_chunks).strip()
-    return final_text or "(codex 无输出) " + fallback[:300], session_id
-
-
-def ask_codex(key: str, text: str, chat_id: str = "", chat_type: str = "") -> str:
-    sid = _get_agent_sid(key, "codex", chat_id, chat_type)
-    tag = sid[:8] if sid else "new"
-    fd, output_file = tempfile.mkstemp(prefix="codex-last-", suffix=".txt", dir=STATE_DIR)
-    os.close(fd)
-    cmd = _build_codex_cmd(text, sid, output_file, CODEX_MODEL)
-    try:
-        reply, seen_sid = _run_codex_streaming(cmd, output_file, tag=tag, input_text=text)
-        if seen_sid:
-            _save_agent_sid(key, "codex", seen_sid, chat_id, chat_type)
-        elif sid is None:
-            print("[warn] Codex 未返回 session_id，本轮回复可用但无法持久续接")
-        return reply
-    except subprocess.TimeoutExpired:
-        return "⌛ Codex 处理超时了，换个更具体的问题再试。"
-    except FileNotFoundError:
-        return _cli_missing_message("Codex", CODEX_BIN, "codex_bin")
-    except Exception as e:  # noqa: BLE001
-        return f"❌ Codex 处理出错：{e}"
-    finally:
-        try:
-            os.remove(output_file)
-        except OSError:
-            pass
-
-
-def ask_agent(key: str, text: str, chat_id: str = "", chat_type: str = "",
-              text_delta_cb=None, model: str = "", agent: str = "") -> str:
-    agent = _normalize_agent(agent) if agent else _get_active_agent(key, chat_id, chat_type)
-    if agent == "codex":
-        return ask_codex(key, text, chat_id, chat_type)
-    return ask_claude(key, text, chat_id, chat_type, text_delta_cb=text_delta_cb, model=model)
-
-
 # ---------- 飞书收发 ----------
 _CARD_MARKER = "<<<CARD>>>"
 _IMG_MARKER = "<<<IMG>>>"
@@ -1365,11 +559,10 @@ def _md_card(content: str) -> str:
 
 
 def _iter_parts(text: str):
-    """把 Claude 输出拆成 (msg_type, content_json) 序列。
+    """把 Agent 输出拆成 (msg_type, content_json) 序列。
 
     三类格式：
-    1. <<<CARD>>> 开头 → Claude 直接给出完整卡片 JSON，bridge 透传，不再包装。
-       适用于需要按钮、多列、标题栏等 markdown 无法表达的场景。
+    1. <<<CARD>>> 开头 → Agent 直接给出完整卡片 JSON，bridge 透传，不再包装。
     2. 文本里夹带本地图片（<<<IMG>>>路径 或 ![](本地路径)）→ 先发文字，再把每张图
        上传换取 image_key，作为独立 image 消息发出。上传失败则降级为一行文字提示。
     3. 其余普通文本 → 按 20000 字符分块，每块包成 schema 2.0 markdown card。
@@ -1445,7 +638,7 @@ def reply_to(message_id: str, chat_id: str, text: str) -> None:
 
 
 # ---------- 流式回复：飞书 CardKit 流式卡片 ----------
-# 思路：先创建一张「streaming_mode」卡片实体，回复用户消息把它发出去；随后随着 Claude
+# 思路：先创建一张「streaming_mode」卡片实体，回复用户消息把它发出去；随后随着 Agent
 # 产出增量文本，按 PUT 全量文本 + 递增 sequence 更新卡片，飞书端做打字机渲染；结束时
 # 写入最终（去掉本地图片引用的）文本并关闭流式，再把本地图片作为独立消息补发。
 # 任何一步失败都 fail-soft：CardStreamer.finish 返回 False，调用方退回普通 reply_to。
@@ -1503,7 +696,7 @@ def _reply_card(message_id: str, card_id: str) -> bool:
 
 
 class CardStreamer:
-    """把 Claude 的增量文本流式更新到一张飞书卡片上。线程内串行使用（同会话 worker）。"""
+    """把 Agent 的增量文本流式更新到一张飞书卡片上。线程内串行使用（同会话 worker）。"""
 
     ELEMENT_ID = "bridge_md"
 
@@ -1706,6 +899,27 @@ def _build_media_prompt(caption: str, paths: list[str]) -> str:
     return head + "\n\n用户没有附文字说明，请先解析/描述这些文件的内容，再等待进一步指示。"
 
 
+def ask_agent(key: str, text: str, chat_id: str = "", chat_type: str = "",
+              text_delta_cb=None, model: str = "", agent: str = "") -> str:
+    """统一派发：选 Agent → 取/建会话 sid → 解析模型 → 调 agent.run → 持久化会话。"""
+    agent_name = _normalize_agent(agent) if agent else _get_active_agent(key, chat_id, chat_type)
+    impl = get_agent(agent_name)
+    if impl.pregenerate_sid:
+        sid, is_new = _get_or_create_agent_sid(key, agent_name, chat_id, chat_type)
+    else:  # CLI 自管会话 id（codex）：传入已有 sid 或 None
+        sid = _get_agent_sid(key, agent_name, chat_id, chat_type)
+        is_new = sid is None
+    # 模型优先级：单条覆盖(model) > 会话级覆盖 > Agent 默认（仅支持切换的 Agent 生效）
+    eff_model = (model or _SESSION_MODELS.get(key, "")) if impl.supports_model_switch else ""
+    cb = text_delta_cb if impl.supports_stream_reply else None
+    result = impl.run(prompt=text, sid=sid, is_new=is_new, model=eff_model, text_delta_cb=cb)
+    if result.new_sid and result.new_sid != sid:
+        _save_agent_sid(key, agent_name, result.new_sid, chat_id, chat_type)
+    elif not impl.pregenerate_sid and sid is None and not result.new_sid:
+        print(f"[warn] {impl.display_name} 未返回 session_id，本轮回复可用但无法持久续接")
+    return result.reply
+
+
 def on_message(data: P2ImMessageReceiveV1) -> None:
     msg = data.event.message
     chat_id = msg.chat_id
@@ -1762,12 +976,13 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
 
     # 命令：切换/查询本会话的临时模型（仅纯文本、无附件时）
     if _is_slash_command(text, "/model") and not attachments:
-        if active_agent == "codex":
+        if not AGENT_CONFIGS[active_agent].supports_model_switch:
             reply_to(
                 message_id,
                 chat_id,
-                "当前 Agent：Codex\n当前模型：gpt-5.5\n"
-                "Codex 固定使用 gpt-5.5，不支持 /model 切换。"
+                f"当前 Agent：{_agent_display_name(active_agent)}\n"
+                f"当前模型：{_agent_model(active_agent, key)}\n"
+                f"{_agent_display_name(active_agent)} 固定模型，不支持 /model 切换。"
                 "如需切换 Claude 模型，请先发送 /agent claude。",
             )
             return
@@ -1797,11 +1012,11 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     per_msg_model = ""
     pm = _MODEL_PREFIX_RE.match(text)
     if pm:
-        if active_agent == "codex":
+        if not AGENT_CONFIGS[active_agent].supports_model_switch:
             reply_to(
                 message_id,
                 chat_id,
-                "Codex 固定使用 gpt-5.5，不支持 [m:...] 单条模型前缀。"
+                f"{_agent_display_name(active_agent)} 固定模型，不支持 [m:...] 单条模型前缀。"
                 "请去掉前缀，或先发送 /agent claude。",
             )
             return
@@ -1818,7 +1033,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     print(f"\n[{_ts()}] 📩 飞书（{where}）收到: {desc}")
 
     # chat_id / message_id 用默认参数绑定，杜绝闭包串扰
-    # 直接喂用户原文：不告诉 Claude 它在飞书、不给 chat_id，它就不会想着自己发消息
+    # 直接喂用户原文：不告诉 Agent 它在飞书、不给 chat_id，它就不会想着自己发消息
     def worker(_key=key, _chat=chat_id, _mid=message_id, _text=text, _type=chat_type,
                _atts=attachments, _model=per_msg_model, _agent=active_agent):
         agent_name = _agent_display_name(_agent)
@@ -1864,6 +1079,20 @@ def _ignore_event(data) -> None:
     return None
 
 
+def _clean_inbox() -> None:
+    """启动时清空 inbox 里的残留下载（崩溃遗留的孤儿；启动时无在途任务，安全）。"""
+    try:
+        for name in os.listdir(INBOX_DIR):
+            p = os.path.join(INBOX_DIR, name)
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 _dispatch = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message)
 # reaction 事件订阅了却没人处理会报 'processor not found'，注册空处理器消音
 if hasattr(_dispatch, "register_p2_im_message_reaction_created_v1"):
@@ -1875,8 +1104,10 @@ handler = _dispatch.build()
 if __name__ == "__main__":
     if not LARK_AVAILABLE:
         raise SystemExit("❌ 缺少依赖 lark-oapi，请先运行: pip install -r requirements.txt")
+    _clean_inbox()
     print(f"✅ 飞书 Agent Gateway v{__version__} 已就绪，正在连接飞书……")
     print(f"   默认 Agent：{_agent_display_name(DEFAULT_AGENT)}；Claude={CLAUDE_MODEL}；Codex={CODEX_MODEL}")
+    print(f"   工作目录(workspace)：{WORKDIR}")
     print("   在飞书里私聊机器人、或群里 @ 它发消息即可；用 /agent claude|codex 切换。\n")
     # 只显示 WARNING 及以上的 SDK 日志，过滤掉 connected / 心跳等噪音
     ws = lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.WARNING)

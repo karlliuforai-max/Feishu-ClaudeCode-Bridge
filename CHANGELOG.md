@@ -9,6 +9,25 @@
 
 暂无
 
+## [0.3.0] - 2026-06-18
+
+### 变更
+
+- 主文件改名：`src/feishu_claude_bridge.py` → `src/feishu_agent_bridge.py`（项目早已是双 Agent，旧名不再贴切）。自定义启动方式需同步更新路径；内置 `run_bridge.command` / `run_bridge.cmd` 已更新。
+- 单文件拆分为三模块：`config.py`（配置加载/运行目录/各 Agent 静态配置）、`agents.py`（Agent 基类 + ClaudeAgent + CodexAgent + 统一 `run()` 接口 + 注册表）、`feishu_agent_bridge.py`（飞书 IM 收发 + 会话持久化 + 派发 + 入口）。新增 Agent 只需在 `agents.py` 增加一个类、在 `config.py` 增加一条 `AgentConfig`。
+- agent 工作目录（cwd）默认改为项目根下的 `workspace/`（可用 `workdir` 覆盖）：下载的附件与 agent 生成的文件都落在 `workspace/`，仓库根目录保持干净。下载附件改存 `workspace/inbox/`，处理后逐条清理，启动时清扫残留。
+
+### 修复
+
+- 修复 Codex 后端完全不可用：`_run_codex_streaming` 误植了一段 Claude 流式横幅代码，引用未定义的 `terminal_echo` / `stream_format`，导致每次 Codex 调用抛 `NameError`（v0.2.2 引入的回归）。
+- 统一 Codex 失败事件名（`turn.failed`），修复失败时终端高亮分支不触发的问题。
+- `sessions.json` 写盘补 `encoding="utf-8"`，避免 Windows 默认 ANSI 编码写入中文群名后被 utf-8 读取判为损坏、丢失会话映射。
+
+### 文档
+
+- README、`docs/VERSIONING.md`、`config.example.json` 更新文件名、项目结构与 `workspace/` 说明。
+- `requirements.txt` 注明运行环境需 Python ≥ 3.10。
+
 ## [0.2.2] - 2026-06-18
 
 ### 新增
@@ -178,7 +197,8 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.7...v0.2.0
