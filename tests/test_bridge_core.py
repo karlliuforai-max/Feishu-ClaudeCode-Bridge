@@ -223,11 +223,36 @@ class BridgeCoreTests(unittest.TestCase):
         self.assertIn(self.bridge.CODEX_SANDBOX, new_cmd)
         self.assertIn("--output-last-message", new_cmd)
         self.assertIn(out, new_cmd)
+        self.assertEqual(new_cmd[-1], "-")
+        self.assertNotIn("hello", new_cmd)
 
         resume_cmd = self.bridge._build_codex_cmd("again", "codex-session-id", out)
         self.assertEqual(resume_cmd[:3], ["codex", "exec", "resume"])
         self.assertIn("codex-session-id", resume_cmd)
         self.assertIn("--output-last-message", resume_cmd)
+        self.assertEqual(resume_cmd[-1], "-")
+        self.assertNotIn("again", resume_cmd)
+
+    def test_codex_event_helpers_extract_text_and_errors(self):
+        text = self.bridge._extract_codex_agent_text({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "OK"},
+        })
+        self.assertEqual(text, "OK")
+
+        err = self.bridge._extract_codex_error({
+            "type": "turn.failed",
+            "error": {"message": "network failed"},
+        })
+        self.assertEqual(err, "network failed")
+
+    def test_clean_codex_final_text_removes_cli_diagnostics(self):
+        raw = "\n".join([
+            "OK",
+            "Reading additional input from stdin...",
+            "2026-06-18T09:57:27.817679Z ERROR codex_api::endpoint::responses_websocket: failed",
+        ])
+        self.assertEqual(self.bridge._clean_codex_final_text(raw), "OK")
 
     def test_summarize_tool_picks_friendly_field(self):
         s = self.bridge._summarize_tool

@@ -633,7 +633,8 @@ def _fallback_no_output(stderr: str) -> str:
 
 def _run_claude_buffered(cmd: list[str]) -> str:
     r = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=CLAUDE_TIMEOUT, cwd=WORKDIR
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=CLAUDE_TIMEOUT, cwd=WORKDIR, stdin=subprocess.DEVNULL
     )
     out = (r.stdout or "").strip()
     return out or _fallback_no_output(r.stderr or "")
@@ -641,15 +642,18 @@ def _run_claude_buffered(cmd: list[str]) -> str:
 
 def _pipe_to_queue(pipe, stream_name: str, out_q: "queue.Queue[tuple[str, str]]", by_line: bool) -> None:
     try:
-        if by_line:
-            for chunk in iter(pipe.readline, ""):
-                out_q.put((stream_name, chunk))
-        else:
-            while True:
-                chunk = pipe.read(1)
-                if not chunk:
-                    break
-                out_q.put((stream_name, chunk))
+        try:
+            if by_line:
+                for chunk in iter(pipe.readline, ""):
+                    out_q.put((stream_name, chunk))
+            else:
+                while True:
+                    chunk = pipe.read(1)
+                    if not chunk:
+                        break
+                    out_q.put((stream_name, chunk))
+        except UnicodeDecodeError as e:
+            out_q.put((stream_name, f"[decode error] {e}\n"))
     finally:
         try:
             pipe.close()
@@ -891,9 +895,12 @@ def _run_claude_streaming(cmd: list[str], stream_format: str, tag: str = "",
     by_line = stream_format == "json"
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=WORKDIR,
         bufsize=1,
     )
@@ -990,7 +997,7 @@ def _build_codex_cmd(text: str, sid: str | None, output_file: str,
         ]
         if CODEX_SKIP_GIT_REPO_CHECK:
             cmd.append("--skip-git-repo-check")
-        cmd += [sid, text]
+        cmd += [sid, "-"]
         return cmd
 
     cmd = [
@@ -1003,7 +1010,7 @@ def _build_codex_cmd(text: str, sid: str | None, output_file: str,
     ]
     if CODEX_SKIP_GIT_REPO_CHECK:
         cmd.append("--skip-git-repo-check")
-    cmd.append(text)
+    cmd.append("-")
     return cmd
 
 
@@ -1027,6 +1034,13 @@ def _extract_codex_session_id(value) -> str | None:
 
 def _codex_event_text(event: dict) -> str:
     etype = str(event.get("type") or event.get("event") or "event")
+    if etype == "item.completed":
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        itype = item.get("type") or "item"
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            return f"[codex {itype}] {_truncate(text, 300)}"
+        return f"[codex {itype}]"
     if etype in {"assistant_message", "agent_message", "message"}:
         text = event.get("message") or event.get("text") or event.get("content") or ""
         if isinstance(text, str):
@@ -1038,17 +1052,63 @@ def _codex_event_text(event: dict) -> str:
     return f"[codex {etype}]"
 
 
-def _run_codex_streaming(cmd: list[str], output_file: str, tag: str = "") -> tuple[str, str | None]:
+def _extract_codex_agent_text(event: dict) -> str:
+    etype = str(event.get("type") or event.get("event") or "")
+    if etype == "item.completed":
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+            return item["text"]
+    if etype in {"assistant_message", "agent_message", "message"}:
+        text = event.get("message") or event.get("text") or event.get("content")
+        return text if isinstance(text, str) else ""
+    return ""
+
+
+def _extract_codex_error(event: dict) -> str:
+    etype = str(event.get("type") or event.get("event") or "")
+    if etype == "error":
+        msg = event.get("message")
+        return msg if isinstance(msg, str) else _short_json(event, 300)
+    if etype == "turn.failed":
+        err = event.get("error")
+        if isinstance(err, dict) and isinstance(err.get("message"), str):
+            return err["message"]
+        return _short_json(event, 300)
+    return ""
+
+
+def _clean_codex_final_text(text: str) -> str:
+    lines = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped == "Reading additional input from stdin...":
+            continue
+        if re.match(r"^\d{4}-\d{2}-\d{2}T.*\sERROR\s", stripped):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _run_codex_streaming(cmd: list[str], output_file: str, tag: str = "",
+                         input_text: str = "") -> tuple[str, str | None]:
     if STREAM_TERMINAL:
         print(f"[{_ts()}] ▶ Codex 开始 [{tag or 'new'}]", flush=True)
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=WORKDIR,
         bufsize=1,
     )
+    try:
+        proc.stdin.write(input_text or "")
+        proc.stdin.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[codex stdin error] {e}")
     out_q: "queue.Queue[tuple[str, str]]" = queue.Queue()
     threads = [
         threading.Thread(target=_pipe_to_queue, args=(proc.stdout, "stdout", out_q, True), daemon=True),
@@ -1059,6 +1119,9 @@ def _run_codex_streaming(cmd: list[str], output_file: str, tag: str = "") -> tup
 
     stdout_lines: list[str] = []
     stderr_chunks: list[str] = []
+    agent_text_parts: list[str] = []
+    error_messages: list[str] = []
+    failed = False
     session_id = None
     deadline = time.monotonic() + CLAUDE_TIMEOUT
     timed_out = False
@@ -1085,6 +1148,14 @@ def _run_codex_streaming(cmd: list[str], output_file: str, tag: str = "") -> tup
                         print(f"[codex raw] {_truncate(raw, 300)}", flush=True)
                 else:
                     session_id = session_id or _extract_codex_session_id(event)
+                    agent_text = _extract_codex_agent_text(event)
+                    if agent_text:
+                        agent_text_parts.append(agent_text)
+                    err = _extract_codex_error(event)
+                    if err:
+                        error_messages.append(err)
+                    if str(event.get("type") or event.get("event") or "") == "turn.failed":
+                        failed = True
                     if STREAM_TERMINAL:
                         print(_codex_event_text(event), flush=True)
 
@@ -1103,12 +1174,17 @@ def _run_codex_streaming(cmd: list[str], output_file: str, tag: str = "") -> tup
 
     try:
         with open(output_file, encoding="utf-8") as f:
-            final_text = f.read().strip()
+            final_text = _clean_codex_final_text(f.read())
     except OSError:
         final_text = ""
 
     if STREAM_TERMINAL:
         print(f"\n[{_ts()}] ■ Codex 结束 [{tag or (session_id or 'new')[:8]}]", flush=True)
+    if failed:
+        msg = error_messages[-1] if error_messages else "未知错误"
+        return f"❌ Codex 处理失败：{msg}", session_id
+    if not final_text and agent_text_parts:
+        final_text = "\n".join(agent_text_parts).strip()
     fallback = "".join(stdout_lines).strip() or "".join(stderr_chunks).strip()
     return final_text or "(codex 无输出) " + fallback[:300], session_id
 
@@ -1120,7 +1196,7 @@ def ask_codex(key: str, text: str, chat_id: str = "", chat_type: str = "") -> st
     os.close(fd)
     cmd = _build_codex_cmd(text, sid, output_file, CODEX_MODEL)
     try:
-        reply, seen_sid = _run_codex_streaming(cmd, output_file, tag=tag)
+        reply, seen_sid = _run_codex_streaming(cmd, output_file, tag=tag, input_text=text)
         if seen_sid:
             _save_agent_sid(key, "codex", seen_sid, chat_id, chat_type)
         elif sid is None:
