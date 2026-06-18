@@ -9,6 +9,20 @@
 
 暂无
 
+## [0.2.1] - 2026-06-18
+
+### 新增
+
+- 新增 `claude_bin` / `codex_bin` 配置项，可显式指定 Claude Code CLI 与 Codex CLI 的可执行文件路径。
+
+### 修复
+
+- 修复 Windows 普通终端启动桥接服务时，因 `codex` 不在 `PATH` 中导致 Codex 后端报 `[WinError 2] 系统找不到指定的文件` 的问题。
+
+### 文档
+
+- README 和配置模板补充 CLI 路径配置说明。
+
 ## [0.2.0] - 2026-06-18
 
 ### 新增
@@ -153,7 +167,8 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.7...v0.2.0
 [0.0.7]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.5...v0.0.6

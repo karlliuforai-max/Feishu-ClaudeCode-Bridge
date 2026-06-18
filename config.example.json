@@ -6,6 +6,8 @@
   "codex_model": "gpt-5.5",
   "codex_sandbox": "workspace-write",
   "codex_skip_git_repo_check": true,
+  "claude_bin": "claude",
+  "codex_bin": "codex",
   "workdir": ".",
   "state_dir": "~/.feishu_bridge",
   "timeout": 600,

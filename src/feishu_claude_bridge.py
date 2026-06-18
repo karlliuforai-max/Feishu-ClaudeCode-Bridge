@@ -21,6 +21,7 @@ feishu_claude_bridge.py
 配置：默认读项目根目录的 config.json（不入库），字段见 README。
   必填: app_id, app_secret
   可选: default_agent / model(默认 claude-sonnet-4-6) / codex_model(gpt-5.5) /
+        codex_sandbox / codex_skip_git_repo_check / claude_bin / codex_bin /
         workdir / state_dir / timeout /
         max_attachment_bytes / stream_terminal / terminal_stream_format /
         stream_reply / stream_reply_interval /
@@ -93,7 +94,7 @@ except ModuleNotFoundError:
     ReplyMessageRequest = _MissingLarkRequest
     ReplyMessageRequestBody = _MissingLarkRequest
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 # 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
 START_TIME_MS = time.time() * 1000
 
@@ -107,6 +108,20 @@ def _expand_path(path: str) -> str:
             rest = raw[2:] if len(raw) > 1 else ""
             raw = os.path.join(home, rest)
     return os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))
+
+
+def _cli_bin(value, default: str) -> str:
+    raw = str(value or default).strip() or default
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    if (
+        raw == "~"
+        or raw.startswith(("~/", "~\\"))
+        or os.path.isabs(expanded)
+        or "/" in raw
+        or "\\" in raw
+    ):
+        return os.path.abspath(expanded)
+    return expanded
 
 
 def _as_bool(value, default: bool = False) -> bool:
@@ -150,12 +165,14 @@ if DEFAULT_AGENT not in VALID_AGENTS:
 
 # claude -p 使用的默认模型 ID
 CLAUDE_MODEL = _conf.get("model", "claude-sonnet-4-6")
-# Codex v0.2.0 固定单模型，避免与 Claude 的 /model 体系混在一起。
+# Codex 固定单模型，避免与 Claude 的 /model 体系混在一起。
 CODEX_MODEL = str(_conf.get("codex_model", "gpt-5.5")).strip()
 if CODEX_MODEL != "gpt-5.5":
-    raise SystemExit("❌ 配置错误: v0.2.0 的 codex_model 只能是 gpt-5.5")
+    raise SystemExit("❌ 配置错误: 当前版本的 codex_model 只能是 gpt-5.5")
 CODEX_SANDBOX = str(_conf.get("codex_sandbox", "workspace-write")).strip() or "workspace-write"
 CODEX_SKIP_GIT_REPO_CHECK = _as_bool(_conf.get("codex_skip_git_repo_check"), True)
+CLAUDE_BIN = _cli_bin(_conf.get("claude_bin"), "claude")
+CODEX_BIN = _cli_bin(_conf.get("codex_bin"), "codex")
 # 模型短名 → 完整 model ID，临时切换时少打字（也可直接传完整 ID）
 MODEL_ALIASES = {
     "opus": "claude-opus-4-8",
@@ -499,7 +516,7 @@ def _format_agent_status(key: str, chat_id: str = "", chat_type: str = "") -> st
         "可用命令：/agent claude、/agent codex、/agent reset",
     ]
     if agent == "codex":
-        lines.append("Codex 在 v0.2.0 固定使用 gpt-5.5，不支持 /model 切换。")
+        lines.append("Codex 固定使用 gpt-5.5，不支持 /model 切换。")
     return "\n".join(lines)
 
 
@@ -618,7 +635,7 @@ def _resolve_model(name: str) -> str | None:
 def _build_claude_cmd(text: str, sid: str, is_new: bool, output_format: str = "text",
                       model: str = "") -> list[str]:
     flag = "--session-id" if is_new else "--resume"
-    cmd = ["claude", "-p", text, flag, sid, "--output-format", output_format,
+    cmd = [CLAUDE_BIN, "-p", text, flag, sid, "--output-format", output_format,
            "--model", model or CLAUDE_MODEL]
     if output_format == "stream-json":
         cmd += ["--verbose", "--include-partial-messages", "--include-hook-events"]
@@ -990,7 +1007,7 @@ def _build_codex_cmd(text: str, sid: str | None, output_file: str,
     model = model or CODEX_MODEL
     if sid:
         cmd = [
-            "codex", "exec", "resume",
+            CODEX_BIN, "exec", "resume",
             "--json",
             "--output-last-message", output_file,
             "--model", model,
@@ -1001,7 +1018,7 @@ def _build_codex_cmd(text: str, sid: str | None, output_file: str,
         return cmd
 
     cmd = [
-        "codex", "exec",
+        CODEX_BIN, "exec",
         "--json",
         "--output-last-message", output_file,
         "--model", model,
@@ -1688,7 +1705,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                 message_id,
                 chat_id,
                 "当前 Agent：Codex\n当前模型：gpt-5.5\n"
-                "Codex 在 v0.2.0 固定使用 gpt-5.5，不支持 /model 切换。"
+                "Codex 固定使用 gpt-5.5，不支持 /model 切换。"
                 "如需切换 Claude 模型，请先发送 /agent claude。",
             )
             return
@@ -1722,7 +1739,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
             reply_to(
                 message_id,
                 chat_id,
-                "Codex 在 v0.2.0 固定使用 gpt-5.5，不支持 [m:...] 单条模型前缀。"
+                "Codex 固定使用 gpt-5.5，不支持 [m:...] 单条模型前缀。"
                 "请去掉前缀，或先发送 /agent claude。",
             )
             return
@@ -1755,7 +1772,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         prompt = _build_media_prompt(_text, paths) if paths else _text
         if not prompt:  # 附件全部下载失败、又无文字
             prompt = "用户发来了附件但下载失败，请告知用户重发或换种方式。"
-        # 流式回复：Claude 保持边生成边更新卡片；Codex v0.2.0 暂以最终回复兜底。
+        # 流式回复：Claude 保持边生成边更新卡片；Codex 暂以最终回复兜底。
         streamer = (CardStreamer(_mid, _chat, STREAM_REPLY_INTERVAL)
                     if STREAM_REPLY and _agent_supports_stream_reply(_agent) else None)
         delta_cb = streamer.push if streamer else None

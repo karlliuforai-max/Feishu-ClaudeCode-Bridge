@@ -2,7 +2,7 @@
 
 本项目遵循语义化版本。
 
-当前版本是 `v0.2.0`。
+当前版本是 `v0.2.1`。
 
 ## 版本来源
 
@@ -15,7 +15,7 @@ src/feishu_claude_bridge.py
 当前变量：
 
 ```python
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 ```
 
 ## 发布策略
@@ -26,7 +26,23 @@ __version__ = "0.2.0"
 - Minor：向后兼容的新能力。
 - Major：配置、状态、命令或部署方式存在不兼容变更。
 
+v0.2.1 属于 Patch：它修复 Windows 普通终端中 CLI 路径不可见导致的 Codex 启动问题，不改变 `/agent` 行为、配置兼容性或状态结构。
+
 v0.2.0 属于 Minor：它新增 Codex 后端和 `/agent` 切换，但保留现有 Claude 行为，并兼容旧配置与旧 session 状态。
+
+## v0.2.1 范围
+
+v0.2.1 包含：
+
+- 新增 `claude_bin` / `codex_bin` 配置项。
+- 修复 `codex` 不在 `PATH` 时的 `[WinError 2]`。
+- README 和配置模板补充 CLI 路径说明。
+
+v0.2.1 不包含：
+
+- 改变 Claude/Codex 模型策略。
+- 改变 session 状态结构。
+- 改变 `/agent`、`/model` 或飞书消息处理语义。
 
 ## v0.2.0 范围
 

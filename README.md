@@ -1,6 +1,6 @@
 # feishu-agent-bridge
 
-> **当前版本：v0.2.0** · 飞书 Agent Gateway · 见 [CHANGELOG](./CHANGELOG.md)
+> **当前版本：v0.2.1** · 飞书 Agent Gateway · 见 [CHANGELOG](./CHANGELOG.md)
 
 把**飞书消息**接到本机已登录的 **Claude Code CLI** 或 **Codex CLI**。同一个飞书机器人、同一个 `app_id`，可在会话内用 `/agent` 无缝切换后端：
 
@@ -40,7 +40,7 @@ codex --version
 codex debug models
 ```
 
-v0.2.0 要求 `codex debug models` 能看到 `gpt-5.5`。
+当前版本要求 `codex debug models` 能看到 `gpt-5.5`。
 
 ## 配置
 
@@ -62,6 +62,8 @@ cp config.example.json config.json
   "codex_model": "gpt-5.5",
   "codex_sandbox": "workspace-write",
   "codex_skip_git_repo_check": true,
+  "claude_bin": "claude",
+  "codex_bin": "codex",
 
   "workdir": ".",
   "state_dir": "~/.feishu_bridge",
@@ -80,10 +82,11 @@ cp config.example.json config.json
 说明：
 
 - `default_agent`：默认后端，支持 `claude` 或 `codex`。
-- `model`：Claude 默认模型；v0.2.0 默认 `claude-sonnet-4-6`。
-- `codex_model`：Codex 模型；v0.2.0 只允许 `gpt-5.5`。
+- `model`：Claude 默认模型；当前默认 `claude-sonnet-4-6`。
+- `codex_model`：Codex 模型；当前只允许 `gpt-5.5`。
 - `codex_sandbox`：传给 `codex exec --sandbox`，默认 `workspace-write`。
 - `codex_skip_git_repo_check`：传给 `codex exec --skip-git-repo-check`，默认开启。
+- `claude_bin` / `codex_bin`：CLI 可执行文件路径；默认走 `PATH`。如果普通终端找不到 Codex，可填绝对路径，例如 `C:/Users/asus/.vscode/extensions/.../codex.exe`。
 - `allowed_tools`：只作用于 Claude Code，默认不含 `Bash`。
 - `workdir` / `state_dir` / `BRIDGE_CONFIG` 支持 `~` 和环境变量展开。
 

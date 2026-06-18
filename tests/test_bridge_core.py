@@ -76,6 +76,8 @@ class BridgeCoreTests(unittest.TestCase):
         self.assertEqual(self.bridge.CODEX_MODEL, "gpt-5.5")
         self.assertEqual(self.bridge.DEFAULT_AGENT, "claude")
         self.assertEqual(self.bridge._agent_model("codex"), "gpt-5.5")
+        self.assertEqual(self.bridge.CLAUDE_BIN, "claude")
+        self.assertEqual(self.bridge.CODEX_BIN, "codex")
 
     def test_legacy_session_records_are_migrated_to_agent_shape(self):
         rec, changed = self.bridge._normalize_session_record("old-claude-sid")
@@ -210,6 +212,20 @@ class BridgeCoreTests(unittest.TestCase):
         self.assertIn("--verbose", cmd)
         self.assertIn("--include-partial-messages", cmd)
         self.assertIn("--include-hook-events", cmd)
+
+    def test_build_cmd_uses_configured_cli_bins(self):
+        original_claude = self.bridge.CLAUDE_BIN
+        original_codex = self.bridge.CODEX_BIN
+        try:
+            self.bridge.CLAUDE_BIN = "C:/Tools/claude.exe"
+            self.bridge.CODEX_BIN = "C:/Tools/codex.exe"
+            claude_cmd = self.bridge._build_claude_cmd("hello", "sid", True)
+            codex_cmd = self.bridge._build_codex_cmd("hello", None, str(self.root / "out.txt"))
+            self.assertEqual(claude_cmd[0], "C:/Tools/claude.exe")
+            self.assertEqual(codex_cmd[0], "C:/Tools/codex.exe")
+        finally:
+            self.bridge.CLAUDE_BIN = original_claude
+            self.bridge.CODEX_BIN = original_codex
 
     def test_build_codex_cmd_new_and_resume(self):
         out = str(self.root / "codex-last.txt")
