@@ -65,9 +65,9 @@ if exist "%PID_FILE%" (
 )
 
 :run
-echo Starting bridge with: %PYTHON_BIN% -u src\feishu_claude_bridge.py
+echo Starting bridge with: %PYTHON_BIN% -u src\feishu_agent_bridge.py
 echo.
-%PYTHON_BIN% -u src\feishu_claude_bridge.py
+%PYTHON_BIN% -u src\feishu_agent_bridge.py
 set "EXIT_CODE=%ERRORLEVEL%"
 
 echo.

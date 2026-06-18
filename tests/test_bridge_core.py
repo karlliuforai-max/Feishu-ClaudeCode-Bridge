@@ -1,91 +1,36 @@
-import importlib
 import io
 import json
 import os
 import sys
-import tempfile
 import unittest
-import warnings
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _bridge_test_base import BridgeTestCase  # noqa: E402
 
 
-class BridgeCoreTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.tmp = tempfile.TemporaryDirectory()
-        cls.root = Path(cls.tmp.name)
-        cls.home = cls.root / "home"
-        cls.workdir = cls.root / "workdir"
-        cls.home.mkdir()
-        cls.workdir.mkdir()
-
-        cls.old_env = {
-            "BRIDGE_CONFIG": os.environ.get("BRIDGE_CONFIG"),
-            "BRIDGE_TEST_WORKDIR": os.environ.get("BRIDGE_TEST_WORKDIR"),
-            "APPDATA": os.environ.get("APPDATA"),
-            "HOME": os.environ.get("HOME"),
-            "LOCALAPPDATA": os.environ.get("LOCALAPPDATA"),
-            "PATH": os.environ.get("PATH"),
-            "USERPROFILE": os.environ.get("USERPROFILE"),
-        }
-        os.environ["HOME"] = str(cls.home)
-        os.environ["USERPROFILE"] = str(cls.home)
-        os.environ["APPDATA"] = str(cls.root / "appdata")
-        os.environ["LOCALAPPDATA"] = str(cls.root / "localappdata")
-        os.environ["PATH"] = ""
-        os.environ["BRIDGE_TEST_WORKDIR"] = str(cls.workdir)
-        config_file = cls.root / "config.json"
-        config_file.write_text(
-            json.dumps(
-                {
-                    "app_id": "cli_test",
-                    "app_secret": "secret_test",
-                    "workdir": "$BRIDGE_TEST_WORKDIR",
-                    "state_dir": "~/bridge-state",
-                }
-            ),
-            encoding="utf-8",
-        )
-        os.environ["BRIDGE_CONFIG"] = str(config_file)
-
-        sys.path.insert(0, str(SRC_ROOT))
-        sys.modules.pop("feishu_claude_bridge", None)
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
-        cls.bridge = importlib.import_module("feishu_claude_bridge")
-
-    @classmethod
-    def tearDownClass(cls):
-        sys.modules.pop("feishu_claude_bridge", None)
-        if sys.path and sys.path[0] == str(SRC_ROOT):
-            sys.path.pop(0)
-        for key, value in cls.old_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        cls.tmp.cleanup()
+class BridgeCoreTests(BridgeTestCase):
+    """飞书 IM / 会话 / 配置层（config.py + feishu_agent_bridge.py）。"""
 
     def test_config_paths_are_expanded(self):
-        self.assertEqual(self.bridge.WORKDIR, os.path.abspath(str(self.workdir)))
+        self.assertEqual(self.config.WORKDIR, os.path.abspath(str(self.workdir)))
         self.assertEqual(
-            self.bridge.STATE_DIR,
+            self.config.STATE_DIR,
             os.path.abspath(str(self.home / "bridge-state")),
         )
+        # inbox 在 workspace(WORKDIR) 下，且导入时已创建
+        self.assertEqual(self.config.INBOX_DIR, os.path.join(self.config.WORKDIR, "inbox"))
+        self.assertTrue(os.path.isdir(self.config.INBOX_DIR))
 
     def test_default_agent_models_are_v020_defaults(self):
-        self.assertEqual(self.bridge.CLAUDE_MODEL, "claude-sonnet-4-6")
-        self.assertEqual(self.bridge.CODEX_MODEL, "gpt-5.5")
-        self.assertEqual(self.bridge.DEFAULT_AGENT, "claude")
+        self.assertEqual(self.config.CLAUDE_MODEL, "claude-sonnet-4-6")
+        self.assertEqual(self.config.CODEX_MODEL, "gpt-5.5")
+        self.assertEqual(self.config.DEFAULT_AGENT, "claude")
         self.assertEqual(self.bridge._agent_model("codex"), "gpt-5.5")
-        self.assertEqual(self.bridge.CLAUDE_BIN, "claude")
-        self.assertEqual(self.bridge.CODEX_BIN, "codex")
+        self.assertEqual(self.config.CLAUDE_BIN, "claude")
+        self.assertEqual(self.config.CODEX_BIN, "codex")
 
     def test_cli_bin_discovers_windows_npm_shim(self):
         if os.name != "nt":
@@ -94,10 +39,10 @@ class BridgeCoreTests(unittest.TestCase):
         npm_dir.mkdir(parents=True, exist_ok=True)
         shim = npm_dir / "claude.cmd"
         shim.write_text("@echo off\r\n", encoding="utf-8")
-        self.assertEqual(self.bridge._cli_bin(None, "claude"), str(shim))
+        self.assertEqual(self.config._cli_bin(None, "claude"), str(shim))
 
     def test_cli_missing_message_is_actionable(self):
-        msg = self.bridge._cli_missing_message("Claude", "claude", "claude_bin")
+        msg = self.config._cli_missing_message("Claude", "claude", "claude_bin")
         self.assertIn("找不到 Claude CLI", msg)
         self.assertIn("claude_bin", msg)
         self.assertNotIn("WinError", msg)
@@ -130,6 +75,16 @@ class BridgeCoreTests(unittest.TestCase):
             self.assertEqual(self.bridge._get_active_agent(key), "claude")
         finally:
             self.bridge.SESSIONS.pop(key, None)
+            self.bridge._save_sessions()
+
+    def test_model_command_blocked_for_fixed_model_agent(self):
+        # Codex 不支持 /model：状态文案应提示固定模型
+        self.bridge._set_active_agent("k-codex-status", "codex")
+        try:
+            status = self.bridge._format_agent_status("k-codex-status")
+            self.assertIn("不支持 /model", status)
+        finally:
+            self.bridge.SESSIONS.pop("k-codex-status", None)
             self.bridge._save_sessions()
 
     def test_bot_mention_fails_closed_when_open_id_unknown(self):
@@ -221,131 +176,6 @@ class BridgeCoreTests(unittest.TestCase):
             self.bridge._get_tenant_token = original_token
             self.bridge.urllib.request.urlopen = original_urlopen
             self.bridge.MAX_ATTACHMENT_BYTES = original_limit
-
-    def test_build_claude_cmd_supports_stream_json_mode(self):
-        cmd = self.bridge._build_claude_cmd(
-            "hello",
-            "00000000-0000-0000-0000-000000000000",
-            True,
-            "stream-json",
-        )
-
-        self.assertIn("--output-format", cmd)
-        self.assertIn("stream-json", cmd)
-        self.assertIn("--verbose", cmd)
-        self.assertIn("--include-partial-messages", cmd)
-        self.assertIn("--include-hook-events", cmd)
-
-    def test_build_cmd_uses_configured_cli_bins(self):
-        original_claude = self.bridge.CLAUDE_BIN
-        original_codex = self.bridge.CODEX_BIN
-        try:
-            self.bridge.CLAUDE_BIN = "C:/Tools/claude.exe"
-            self.bridge.CODEX_BIN = "C:/Tools/codex.exe"
-            claude_cmd = self.bridge._build_claude_cmd("hello", "sid", True)
-            codex_cmd = self.bridge._build_codex_cmd("hello", None, str(self.root / "out.txt"))
-            self.assertEqual(claude_cmd[0], "C:/Tools/claude.exe")
-            self.assertEqual(codex_cmd[0], "C:/Tools/codex.exe")
-        finally:
-            self.bridge.CLAUDE_BIN = original_claude
-            self.bridge.CODEX_BIN = original_codex
-
-    def test_build_codex_cmd_new_and_resume(self):
-        out = str(self.root / "codex-last.txt")
-        new_cmd = self.bridge._build_codex_cmd("hello", None, out)
-        self.assertEqual(new_cmd[:2], ["codex", "exec"])
-        self.assertIn("--model", new_cmd)
-        self.assertIn("gpt-5.5", new_cmd)
-        self.assertIn("--cd", new_cmd)
-        self.assertIn(self.bridge.WORKDIR, new_cmd)
-        self.assertIn("--sandbox", new_cmd)
-        self.assertIn(self.bridge.CODEX_SANDBOX, new_cmd)
-        self.assertIn("--output-last-message", new_cmd)
-        self.assertIn(out, new_cmd)
-        self.assertEqual(new_cmd[-1], "-")
-        self.assertNotIn("hello", new_cmd)
-
-        resume_cmd = self.bridge._build_codex_cmd("again", "codex-session-id", out)
-        self.assertEqual(resume_cmd[:3], ["codex", "exec", "resume"])
-        self.assertIn("codex-session-id", resume_cmd)
-        self.assertIn("--output-last-message", resume_cmd)
-        self.assertEqual(resume_cmd[-1], "-")
-        self.assertNotIn("again", resume_cmd)
-
-    def test_codex_event_helpers_extract_text_and_errors(self):
-        text = self.bridge._extract_codex_agent_text({
-            "type": "item.completed",
-            "item": {"type": "agent_message", "text": "OK"},
-        })
-        self.assertEqual(text, "OK")
-
-        err = self.bridge._extract_codex_error({
-            "type": "turn.failed",
-            "error": {"message": "network failed"},
-        })
-        self.assertEqual(err, "network failed")
-
-    def test_clean_codex_final_text_removes_cli_diagnostics(self):
-        raw = "\n".join([
-            "OK",
-            "Reading additional input from stdin...",
-            "2026-06-18T09:57:27.817679Z ERROR codex_api::endpoint::responses_websocket: failed",
-        ])
-        self.assertEqual(self.bridge._clean_codex_final_text(raw), "OK")
-
-    def test_summarize_tool_picks_friendly_field(self):
-        s = self.bridge._summarize_tool
-        self.assertEqual(s("Read", {"file_path": "a.txt"}), "a.txt")
-        self.assertEqual(s("Bash", {"command": "ls -la"}), "ls -la")
-        self.assertEqual(s("WebFetch", {"url": "https://x.dev"}), "https://x.dev")
-        self.assertEqual(s("WebSearch", {"query": "feishu"}), "feishu")
-        self.assertEqual(s("TodoWrite", {"todos": [1, 2, 3]}), "3 项待办")
-
-    def test_collapse_folds_long_results(self):
-        long = "\n".join(f"line{i}" for i in range(20))
-        out = self.bridge._collapse(long, max_lines=3)
-        self.assertEqual(out.count("│ line"), 3)
-        self.assertIn("已折叠", out)
-        self.assertEqual(self.bridge._collapse("short"), "    │ short")
-        self.assertEqual(self.bridge._collapse(""), "")
-
-    def test_stream_json_renderer_pairs_tools_and_streams_text(self):
-        deltas = []
-        r = self.bridge._StreamJsonRenderer(echo=False, on_text_delta=deltas.append)
-        # 助手发起工具调用
-        r.feed(json.dumps({
-            "type": "assistant",
-            "message": {"content": [
-                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "a.txt"}},
-            ]},
-        }))
-        self.assertIn("t1", r.tools)
-        # 工具结果配对，消费掉记录
-        r.feed(json.dumps({
-            "type": "user",
-            "message": {"content": [
-                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
-            ]},
-        }))
-        self.assertNotIn("t1", r.tools)
-        # 增量文本通过回调流出
-        r.feed(json.dumps({
-            "type": "stream_event",
-            "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hel"}},
-        }))
-        r.feed(json.dumps({
-            "type": "stream_event",
-            "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "lo"}},
-        }))
-        self.assertEqual(deltas, ["Hel", "lo"])
-        # result 事件给出权威最终文本
-        r.feed(json.dumps({"type": "result", "subtype": "success", "result": "final answer"}))
-        self.assertEqual(r.final_text, "final answer")
-
-    def test_stream_json_renderer_marks_errors(self):
-        r = self.bridge._StreamJsonRenderer(echo=False)
-        r.feed(json.dumps({"type": "result", "subtype": "error_max_turns", "result": "x"}))
-        self.assertTrue(r.error)
 
     def test_streaming_card_json_uses_element_id_and_streaming_mode(self):
         card = json.loads(self.bridge._streaming_card_json("hi"))

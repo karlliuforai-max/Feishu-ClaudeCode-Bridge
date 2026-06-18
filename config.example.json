@@ -8,7 +8,7 @@
   "codex_skip_git_repo_check": true,
   "claude_bin": "claude",
   "codex_bin": "codex",
-  "workdir": ".",
+  "workdir": "workspace",
   "state_dir": "~/.feishu_bridge",
   "timeout": 600,
   "max_attachment_bytes": 26214400,

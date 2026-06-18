@@ -2,20 +2,20 @@
 
 本项目遵循语义化版本。
 
-当前版本是 `v0.2.2`。
+当前版本是 `v0.3.0`。
 
 ## 版本来源
 
 运行时版本定义在：
 
 ```text
-src/feishu_claude_bridge.py
+src/feishu_agent_bridge.py
 ```
 
 当前变量：
 
 ```python
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 ```
 
 ## 发布策略
@@ -26,11 +26,29 @@ __version__ = "0.2.2"
 - Minor：向后兼容的新能力。
 - Major：配置、状态、命令或部署方式存在不兼容变更。
 
+v0.3.0 属于 Minor：它把单文件拆成 `config.py` / `agents.py` / `feishu_agent_bridge.py` 三模块、把 agent 工作目录默认改到项目根下的 `workspace/`，并修复 Codex 启动崩溃；`/agent`、`/model`、飞书消息语义与 session 状态结构保持兼容。注意主文件已由 `feishu_claude_bridge.py` 改名为 `feishu_agent_bridge.py`，自定义启动方式需同步更新路径。
+
 v0.2.2 属于 Patch：它增强 CLI 自动发现和错误提示，并新增 Windows 双击启动脚本，不改变 `/agent` 行为、配置兼容性或状态结构。
 
 v0.2.1 属于 Patch：它修复 Windows 普通终端中 CLI 路径不可见导致的 Codex 启动问题，不改变 `/agent` 行为、配置兼容性或状态结构。
 
 v0.2.0 属于 Minor：它新增 Codex 后端和 `/agent` 切换，但保留现有 Claude 行为，并兼容旧配置与旧 session 状态。
+
+## v0.3.0 范围
+
+v0.3.0 包含：
+
+- 主文件改名 `feishu_claude_bridge.py` → `feishu_agent_bridge.py`。
+- 单文件拆分为三模块：`config.py`（配置/路径/Agent 配置）、`agents.py`（Agent 抽象 + 统一 `run()`）、`feishu_agent_bridge.py`（IM 收发/会话/派发）。
+- agent 工作目录默认改为项目根下的 `workspace/`，下载附件落 `workspace/inbox/`，启动时清扫残留。
+- 修复 Codex 因误植 Claude 横幅导致的 `NameError`（v0.2.2 回归）。
+- `sessions.json` 写盘补 `encoding="utf-8"`，避免 Windows 上中文群名写读编码不一致。
+
+v0.3.0 不包含：
+
+- 改变 `/agent`、`/model` 或飞书消息处理语义。
+- 改变 session 状态结构（仍兼容旧 `sessions.json`）。
+- 新增第三个 Agent 或多 Codex 模型。
 
 ## v0.2.2 范围
 
