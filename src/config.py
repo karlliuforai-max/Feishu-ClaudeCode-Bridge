@@ -182,12 +182,46 @@ def _resolve_model(name: str) -> str | None:
 
 
 # ---------- 运行目录 ----------
-# claude/codex 的运行目录（cwd）默认是项目根下的 workspace/：agent 下载与生成的文件都
-# 落在这里，仓库根目录保持干净。仍可用 config.json 的 workdir 覆盖。
-WORKDIR = _expand_path(_conf.get("workdir") or os.path.join(BASE_DIR, "workspace"))
+# 多应用并行：默认目录按 app_id 分子目录，保证「一进程一应用」时各自的 sessions.json 与
+# workspace/inbox 互不串扰；显式配置 workdir / state_dir 则原样使用（由用户自行保证隔离）。
+def _safe_app_id(app_id: str) -> str:
+    """把 app_id 压成安全的目录名（飞书 app_id 形如 cli_xxx，本就安全，仅作防御）。"""
+    s = "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(app_id)).strip("._-")
+    return s or "default"
+
+
+def _resolve_dirs(app_id: str, workdir_cfg, state_cfg) -> tuple[str, str]:
+    """解析 (WORKDIR, STATE_DIR)。未显式配置时按 app_id 落子目录，实现多应用隔离。"""
+    slug = _safe_app_id(app_id)
+    workdir = (_expand_path(workdir_cfg) if workdir_cfg
+               else _expand_path(os.path.join(BASE_DIR, "workspace", slug)))
+    state = (_expand_path(state_cfg) if state_cfg
+             else _expand_path(os.path.join("~/.feishu_bridge", slug)))
+    return workdir, state
+
+
+def _migrate_legacy_sessions(state_dir: str, state_cfg_was_explicit: bool) -> None:
+    """一次性迁移：旧版单应用默认把 sessions.json 放在 ~/.feishu_bridge/ 顶层；现在默认带
+    app_id 子目录。仅当 state_dir 用默认、新位置还没有、而旧顶层文件存在时，搬进来，
+    避免升级后“丢上下文”。同盘 os.replace 原子移动。"""
+    if state_cfg_was_explicit:
+        return
+    legacy = _expand_path(os.path.join("~/.feishu_bridge", "sessions.json"))
+    new = os.path.join(state_dir, "sessions.json")
+    if os.path.isfile(legacy) and not os.path.exists(new):
+        os.makedirs(state_dir, exist_ok=True)
+        try:
+            os.replace(legacy, new)
+            print(f"[migrate] 旧 sessions.json -> {new}")
+        except OSError as e:
+            print(f"[warn] sessions.json 迁移失败（忽略，将新建）：{e}")
+
+
+# claude/codex 的运行目录（cwd）默认是项目根下的 workspace/<app_id>/：agent 下载与生成的
+# 文件都落在这里，仓库根目录保持干净。
+WORKDIR, STATE_DIR = _resolve_dirs(APP_ID, _conf.get("workdir"), _conf.get("state_dir"))
 WORKSPACE_DIR = WORKDIR
 # session 持久化目录（内部状态，与用户可见的 workspace 分开）
-STATE_DIR = _expand_path(_conf.get("state_dir") or "~/.feishu_bridge")
 SESSIONS_FILE = os.path.join(STATE_DIR, "sessions.json")
 # 用户发来的图片/文件下载到这里，处理完即删。
 # 放在 WORKDIR 下：claude -p 以 WORKDIR 为工作目录，沙箱通常只允许读工作目录内的文件，
@@ -227,6 +261,8 @@ ALLOWED_CHATS = set(_allow) if _allow else None
 # 启动期创建所有运行目录（含 workspace 与 inbox）
 for _d in (STATE_DIR, WORKDIR, INBOX_DIR):
     os.makedirs(_d, exist_ok=True)
+# 旧版顶层 sessions.json 一次性迁移到本应用的 state 子目录（须在 bridge 读 sessions 之前）
+_migrate_legacy_sessions(STATE_DIR, bool(_conf.get("state_dir")))
 
 
 # ---------- 每个 Agent 的静态配置 ----------

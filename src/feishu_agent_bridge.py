@@ -109,7 +109,7 @@ from config import (
     _ts,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 # 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
 START_TIME_MS = time.time() * 1000
 
