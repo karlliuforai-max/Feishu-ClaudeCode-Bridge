@@ -32,6 +32,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -94,7 +95,7 @@ except ModuleNotFoundError:
     ReplyMessageRequest = _MissingLarkRequest
     ReplyMessageRequestBody = _MissingLarkRequest
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 # 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
 START_TIME_MS = time.time() * 1000
 
@@ -110,6 +111,50 @@ def _expand_path(path: str) -> str:
     return os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))
 
 
+def _common_cli_candidates(command: str) -> list[str]:
+    command = command.strip()
+    if os.name != "nt" or command not in {"claude", "codex"}:
+        return []
+
+    candidates: list[str] = []
+    appdata = os.environ.get("APPDATA", "")
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    userprofile = os.environ.get("USERPROFILE", "")
+
+    if appdata:
+        npm_dir = os.path.join(appdata, "npm")
+        candidates += [
+            os.path.join(npm_dir, f"{command}.cmd"),
+            os.path.join(npm_dir, f"{command}.exe"),
+            os.path.join(npm_dir, command),
+        ]
+
+    if command == "claude":
+        if userprofile:
+            candidates += [
+                os.path.join(userprofile, ".claude", "local", "claude.cmd"),
+                os.path.join(userprofile, ".claude", "local", "claude.exe"),
+            ]
+        if localappdata:
+            candidates += [
+                os.path.join(localappdata, "claude-cli-nodejs", "claude.cmd"),
+                os.path.join(localappdata, "claude-cli-nodejs", "claude.exe"),
+            ]
+    elif command == "codex" and userprofile:
+        ext_root = os.path.join(userprofile, ".vscode", "extensions")
+        if os.path.isdir(ext_root):
+            try:
+                for name in os.listdir(ext_root):
+                    if name.startswith("openai.chatgpt-"):
+                        candidates.append(os.path.join(
+                            ext_root, name, "bin", "windows-x86_64", "codex.exe"
+                        ))
+            except OSError:
+                pass
+
+    return candidates
+
+
 def _cli_bin(value, default: str) -> str:
     raw = str(value or default).strip() or default
     expanded = os.path.expandvars(os.path.expanduser(raw))
@@ -121,7 +166,20 @@ def _cli_bin(value, default: str) -> str:
         or "\\" in raw
     ):
         return os.path.abspath(expanded)
+    found = shutil.which(expanded)
+    if found:
+        return found
+    for candidate in _common_cli_candidates(expanded):
+        if os.path.isfile(candidate):
+            return candidate
     return expanded
+
+
+def _cli_missing_message(agent_name: str, configured_bin: str, config_key: str) -> str:
+    return (
+        f"❌ 找不到 {agent_name} CLI：{configured_bin}\n"
+        f"请先安装并登录 {agent_name} CLI，或在 config.json 中配置 `{config_key}` 为可执行文件绝对路径。"
+    )
 
 
 def _as_bool(value, default: bool = False) -> bool:
@@ -907,8 +965,6 @@ class _StreamJsonRenderer:
 
 def _run_claude_streaming(cmd: list[str], stream_format: str, tag: str = "",
                           text_delta_cb=None, terminal_echo: bool = True) -> str:
-    if terminal_echo:
-        print(f"[{_ts()}] ▶ Claude 流开始 [{tag}]（format={stream_format}）", flush=True)
     by_line = stream_format == "json"
     proc = subprocess.Popen(
         cmd,
@@ -998,6 +1054,8 @@ def ask_claude(key: str, text: str, chat_id: str = "", chat_type: str = "",
         return _run_claude_buffered(cmd)
     except subprocess.TimeoutExpired:
         return "⌛ 处理超时了，换个更具体的问题再试。"
+    except FileNotFoundError:
+        return _cli_missing_message("Claude", CLAUDE_BIN, "claude_bin")
     except Exception as e:  # noqa: BLE001
         return f"❌ 处理出错：{e}"
 
@@ -1121,6 +1179,8 @@ def _run_codex_streaming(cmd: list[str], output_file: str, tag: str = "",
         cwd=WORKDIR,
         bufsize=1,
     )
+    if terminal_echo:
+        print(f"[{_ts()}] ▶ Claude 流开始 [{tag}]（format={stream_format}）", flush=True)
     try:
         proc.stdin.write(input_text or "")
         proc.stdin.close()
@@ -1221,6 +1281,8 @@ def ask_codex(key: str, text: str, chat_id: str = "", chat_type: str = "") -> st
         return reply
     except subprocess.TimeoutExpired:
         return "⌛ Codex 处理超时了，换个更具体的问题再试。"
+    except FileNotFoundError:
+        return _cli_missing_message("Codex", CODEX_BIN, "codex_bin")
     except Exception as e:  # noqa: BLE001
         return f"❌ Codex 处理出错：{e}"
     finally:

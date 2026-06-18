@@ -7,9 +7,18 @@
 
 ## [Unreleased]
 
+暂无
+
+## [0.2.2] - 2026-06-18
+
 ### 新增
 
 - 新增 Windows 双击启动脚本 `run_bridge.cmd`：在前台控制台运行服务，关闭窗口即停止服务。
+- CLI 自动发现增强：`claude_bin` / `codex_bin` 未配置绝对路径时，会尝试 `PATH`、Windows npm 全局目录、Claude 本地目录和 VS Code Codex 扩展目录。
+
+### 修复
+
+- 修复 Claude CLI 不在 `PATH` 时，飞书回复直接暴露 `[WinError 2] 系统找不到指定的文件` 的问题；现在会提示安装 Claude CLI 或配置 `claude_bin`。
 
 ## [0.2.1] - 2026-06-18
 
@@ -169,7 +178,8 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.7...v0.2.0
 [0.0.7]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.0.6...v0.0.7

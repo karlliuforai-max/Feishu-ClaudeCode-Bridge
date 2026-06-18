@@ -1,6 +1,6 @@
 # feishu-agent-bridge
 
-> **当前版本：v0.2.1** · 飞书 Agent Gateway · 见 [CHANGELOG](./CHANGELOG.md)
+> **当前版本：v0.2.2** · 飞书 Agent Gateway · 见 [CHANGELOG](./CHANGELOG.md)
 
 把**飞书消息**接到本机已登录的 **Claude Code CLI** 或 **Codex CLI**。同一个飞书机器人、同一个 `app_id`，可在会话内用 `/agent` 无缝切换后端：
 
@@ -86,7 +86,7 @@ cp config.example.json config.json
 - `codex_model`：Codex 模型；当前只允许 `gpt-5.5`。
 - `codex_sandbox`：传给 `codex exec --sandbox`，默认 `workspace-write`。
 - `codex_skip_git_repo_check`：传给 `codex exec --skip-git-repo-check`，默认开启。
-- `claude_bin` / `codex_bin`：CLI 可执行文件路径；默认走 `PATH`。如果普通终端找不到 Codex，可填绝对路径，例如 `C:/Users/asus/.vscode/extensions/.../codex.exe`。
+- `claude_bin` / `codex_bin`：CLI 可执行文件路径；默认先走 `PATH`，再尝试 Windows 常见安装位置。仍找不到时，可填绝对路径，例如 `C:/Users/asus/.vscode/extensions/.../codex.exe` 或 `C:/Users/asus/AppData/Roaming/npm/claude.cmd`。
 - `allowed_tools`：只作用于 Claude Code，默认不含 `Bash`。
 - `workdir` / `state_dir` / `BRIDGE_CONFIG` 支持 `~` 和环境变量展开。
 

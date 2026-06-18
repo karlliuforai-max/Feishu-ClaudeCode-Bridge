@@ -29,9 +29,17 @@ class BridgeCoreTests(unittest.TestCase):
         cls.old_env = {
             "BRIDGE_CONFIG": os.environ.get("BRIDGE_CONFIG"),
             "BRIDGE_TEST_WORKDIR": os.environ.get("BRIDGE_TEST_WORKDIR"),
+            "APPDATA": os.environ.get("APPDATA"),
             "HOME": os.environ.get("HOME"),
+            "LOCALAPPDATA": os.environ.get("LOCALAPPDATA"),
+            "PATH": os.environ.get("PATH"),
+            "USERPROFILE": os.environ.get("USERPROFILE"),
         }
         os.environ["HOME"] = str(cls.home)
+        os.environ["USERPROFILE"] = str(cls.home)
+        os.environ["APPDATA"] = str(cls.root / "appdata")
+        os.environ["LOCALAPPDATA"] = str(cls.root / "localappdata")
+        os.environ["PATH"] = ""
         os.environ["BRIDGE_TEST_WORKDIR"] = str(cls.workdir)
         config_file = cls.root / "config.json"
         config_file.write_text(
@@ -78,6 +86,21 @@ class BridgeCoreTests(unittest.TestCase):
         self.assertEqual(self.bridge._agent_model("codex"), "gpt-5.5")
         self.assertEqual(self.bridge.CLAUDE_BIN, "claude")
         self.assertEqual(self.bridge.CODEX_BIN, "codex")
+
+    def test_cli_bin_discovers_windows_npm_shim(self):
+        if os.name != "nt":
+            self.skipTest("Windows npm shim discovery only applies on Windows")
+        npm_dir = self.root / "appdata" / "npm"
+        npm_dir.mkdir(parents=True, exist_ok=True)
+        shim = npm_dir / "claude.cmd"
+        shim.write_text("@echo off\r\n", encoding="utf-8")
+        self.assertEqual(self.bridge._cli_bin(None, "claude"), str(shim))
+
+    def test_cli_missing_message_is_actionable(self):
+        msg = self.bridge._cli_missing_message("Claude", "claude", "claude_bin")
+        self.assertIn("找不到 Claude CLI", msg)
+        self.assertIn("claude_bin", msg)
+        self.assertNotIn("WinError", msg)
 
     def test_legacy_session_records_are_migrated_to_agent_shape(self):
         rec, changed = self.bridge._normalize_session_record("old-claude-sid")
