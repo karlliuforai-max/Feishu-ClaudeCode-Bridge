@@ -155,7 +155,6 @@ CODEX_MODEL = str(_conf.get("codex_model", "gpt-5.5")).strip()
 if CODEX_MODEL != "gpt-5.5":
     raise SystemExit("❌ 配置错误: v0.2.0 的 codex_model 只能是 gpt-5.5")
 CODEX_SANDBOX = str(_conf.get("codex_sandbox", "workspace-write")).strip() or "workspace-write"
-CODEX_APPROVAL = str(_conf.get("codex_approval", "never")).strip() or "never"
 CODEX_SKIP_GIT_REPO_CHECK = _as_bool(_conf.get("codex_skip_git_repo_check"), True)
 # 模型短名 → 完整 model ID，临时切换时少打字（也可直接传完整 ID）
 MODEL_ALIASES = {
@@ -1001,7 +1000,6 @@ def _build_codex_cmd(text: str, sid: str | None, output_file: str,
         "--model", model,
         "--cd", WORKDIR,
         "--sandbox", CODEX_SANDBOX,
-        "--ask-for-approval", CODEX_APPROVAL,
     ]
     if CODEX_SKIP_GIT_REPO_CHECK:
         cmd.append("--skip-git-repo-check")

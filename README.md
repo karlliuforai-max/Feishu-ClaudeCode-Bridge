@@ -61,7 +61,6 @@ cp config.example.json config.json
   "model": "claude-sonnet-4-6",
   "codex_model": "gpt-5.5",
   "codex_sandbox": "workspace-write",
-  "codex_approval": "never",
   "codex_skip_git_repo_check": true,
 
   "workdir": ".",
@@ -84,7 +83,7 @@ cp config.example.json config.json
 - `model`：Claude 默认模型；v0.2.0 默认 `claude-sonnet-4-6`。
 - `codex_model`：Codex 模型；v0.2.0 只允许 `gpt-5.5`。
 - `codex_sandbox`：传给 `codex exec --sandbox`，默认 `workspace-write`。
-- `codex_approval`：传给 `codex exec --ask-for-approval`，默认 `never`，避免无头运行卡住。
+- `codex_skip_git_repo_check`：传给 `codex exec --skip-git-repo-check`，默认开启。
 - `allowed_tools`：只作用于 Claude Code，默认不含 `Bash`。
 - `workdir` / `state_dir` / `BRIDGE_CONFIG` 支持 `~` 和环境变量展开。
 
@@ -168,7 +167,7 @@ macOS 用户也可双击 `run_bridge.command` 在独立 Terminal 窗口运行。
 - `config.json` 含真实密钥，已被 `.gitignore` 忽略，请勿提交。
 - 飞书发送只由桥通过“回复原消息”完成，避免 Agent 自己把消息发错群。
 - Claude 默认工具白名单不含 `Bash`。
-- Codex 默认 `workspace-write` + `approval never`，适合无头运行；更高权限需显式修改配置。
+- Codex 默认使用 `workspace-write` 沙箱，适合无头运行；更高权限需显式修改配置。
 - 附件下载有大小上限，默认 25MB。
 
 ## 版本管理

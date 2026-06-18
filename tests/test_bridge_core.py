@@ -221,8 +221,6 @@ class BridgeCoreTests(unittest.TestCase):
         self.assertIn(self.bridge.WORKDIR, new_cmd)
         self.assertIn("--sandbox", new_cmd)
         self.assertIn(self.bridge.CODEX_SANDBOX, new_cmd)
-        self.assertIn("--ask-for-approval", new_cmd)
-        self.assertIn(self.bridge.CODEX_APPROVAL, new_cmd)
         self.assertIn("--output-last-message", new_cmd)
         self.assertIn(out, new_cmd)
 

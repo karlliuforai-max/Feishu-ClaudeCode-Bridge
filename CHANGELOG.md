@@ -21,7 +21,7 @@
   - `/agent reset` 恢复配置里的默认 Agent。
 - 新增 Codex 后端：使用 `codex exec` / `codex exec resume` 无头执行，并通过 `--output-last-message` 捕获最终回复。
 - 新增 Agent 独立 session 状态：Claude 和 Codex 的会话 ID 分开保存，切换 Agent 不污染对方上下文。
-- 新增 Codex 配置项：`codex_model`、`codex_sandbox`、`codex_approval`、`codex_skip_git_repo_check`。
+- 新增 Codex 配置项：`codex_model`、`codex_sandbox`、`codex_skip_git_repo_check`。
 - 新增 `docs/VERSIONING.md` 与 v0.1.0 设计文档，记录版本边界、状态迁移和发布检查项。
 
 ### 变更
