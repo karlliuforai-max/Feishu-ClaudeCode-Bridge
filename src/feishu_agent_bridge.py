@@ -40,6 +40,7 @@ try:
         CreateImageRequestBody,
         CreateMessageRequest,
         CreateMessageRequestBody,
+        GetMessageRequest,
         P2ImMessageReceiveV1,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
@@ -82,6 +83,7 @@ except ModuleNotFoundError:
     CreateImageRequestBody = _MissingLarkRequest
     CreateMessageRequest = _MissingLarkRequest
     CreateMessageRequestBody = _MissingLarkRequest
+    GetMessageRequest = _MissingLarkRequest
     P2ImMessageReceiveV1 = object
     ReplyMessageRequest = _MissingLarkRequest
     ReplyMessageRequestBody = _MissingLarkRequest
@@ -109,7 +111,7 @@ from config import (
     _ts,
 )
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 # 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
 START_TIME_MS = time.time() * 1000
 
@@ -854,16 +856,38 @@ def _download_resource(message_id: str, file_key: str, rtype: str, name: str = "
         return None
 
 
+def _resolve_mentions(text: str, mentions) -> str:
+    """把正文里的 @_user_N 占位符替换成可读的 @姓名，保留“@了谁”的信息。
+
+    飞书在正文里只放占位符 @_user_1 / @_user_2…，真正被 @ 的人/机器人名字在
+    msg.mentions[].name（占位符对应 .key）。早期实现把占位符整体删掉，会丢失
+    “@的是本机器人 / 他人 / 别的机器人”这层信息，导致 Agent 拿不到完整语义。
+    现在改为按 key 映射成 @姓名；拿不到名字的占位符仍然删掉，避免漏出 @_user_N。"""
+    if not text:
+        return text
+    name_by_key = {}
+    for m in mentions or []:
+        key = getattr(m, "key", None)            # "@_user_1"
+        name = (getattr(m, "name", None) or "").strip()
+        if key:
+            name_by_key[key] = f"@{name}" if name else ""
+    resolved = _MENTION_RE.sub(lambda mt: name_by_key.get(mt.group(0), ""), text)
+    # 删除/替换占位符后可能留下多余空格，收一下但保留换行
+    return re.sub(r"[ \t]{2,}", " ", resolved).strip()
+
+
 def _parse_message(msg) -> tuple[str | None, list[dict]]:
     """把消息解析成 (文字, 附件列表)；附件为 {file_key,type,name}。
-    支持 text / image / file / post（富文本）；不支持的类型返回 (None, [])。"""
+    支持 text / image / file / post（富文本）；不支持的类型返回 (None, [])。
+    文字里的 @ 会保留成可读的 @姓名（见 _resolve_mentions）。"""
     try:
         content = json.loads(msg.content)
     except Exception:  # noqa: BLE001
         return None, []
+    mentions = getattr(msg, "mentions", None)
     mtype = msg.message_type
     if mtype == "text":
-        return _MENTION_RE.sub("", content.get("text", "")).strip(), []
+        return _resolve_mentions(content.get("text", ""), mentions), []
     if mtype == "image":
         key = content.get("image_key")
         return "", [{"file_key": key, "type": "image", "name": ""}] if key else []
@@ -884,7 +908,7 @@ def _parse_message(msg) -> tuple[str | None, list[dict]]:
                     atts.append({"file_key": seg["image_key"], "type": "image", "name": ""})
                 elif tag == "media" and seg.get("file_key"):
                     atts.append({"file_key": seg["file_key"], "type": "file", "name": seg.get("file_name", "")})
-        caption = _MENTION_RE.sub("", " ".join(t for t in texts if t)).strip()
+        caption = _resolve_mentions(" ".join(t for t in texts if t), mentions)
         return caption, atts
     return None, []  # audio / sticker / 其它：暂不支持
 
@@ -897,6 +921,86 @@ def _build_media_prompt(caption: str, paths: list[str]) -> str:
     if caption:
         return f"{head}\n\n用户附言：{caption}"
     return head + "\n\n用户没有附文字说明，请先解析/描述这些文件的内容，再等待进一步指示。"
+
+
+def _replied_message_id(msg) -> str | None:
+    """识别飞书“回复”引用关系，返回被直接回复的那条消息 id；没有则 None。
+    v1 只读直接父消息（parent_id），不递归展开 root/thread，避免把整条回复链
+    甚至无关历史带进上下文。"""
+    pid = getattr(msg, "parent_id", None)
+    return pid or None
+
+
+def _fetch_message(message_id: str):
+    """用 bot(tenant) 身份拉取被回复的消息，转成可喂给 _parse_message 的轻量对象。
+
+    失败一律 fail-soft 返回 None（已删除 / 无权限 / 网络异常 / 空），绝不影响
+    当前消息处理。返回对象刻意复用事件消息的字段名（content / message_type /
+    mentions），这样能直接交给 _parse_message 复用现有解析逻辑。"""
+    try:
+        req = GetMessageRequest.builder().message_id(message_id).build()
+        resp = client.im.v1.message.get(req)
+        if not resp.success():
+            print(f"[reply-context] 拉取被回复消息失败 code={getattr(resp, 'code', '?')} "
+                  f"msg={getattr(resp, 'msg', '')}")
+            return None
+        items = getattr(resp.data, "items", None) or []
+        if not items:
+            return None
+        item = items[0]
+        body = getattr(item, "body", None)
+        content = getattr(body, "content", None) if body else None
+        if content is None:
+            return None
+        return SimpleNamespace(
+            message_id=getattr(item, "message_id", message_id),
+            message_type=getattr(item, "msg_type", None),
+            content=content,
+            mentions=getattr(item, "mentions", None) or [],
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[reply-context] 拉取被回复消息异常: {e}")
+        return None
+
+
+def _build_agent_prompt(
+    current_text: str,
+    current_paths: list[str],
+    replied_text: str = "",
+    replied_paths: list[str] | None = None,
+    reply_failed: bool = False,
+) -> str:
+    """组合给 Agent 的提示词，明确区分“用户本次消息”和“回复引用的上下文”。
+
+    没有任何回复引用时退回原行为（_build_media_prompt / 纯文本），保证现有能力不回退。"""
+    replied_paths = replied_paths or []
+    has_reply = bool(replied_text or replied_paths or reply_failed)
+    if not has_reply:
+        return _build_media_prompt(current_text, current_paths) if current_paths else current_text
+
+    blocks: list[str] = []
+    cur = current_text or ""
+    if current_paths:
+        listing = "\n".join(f"- {p}" for p in current_paths)
+        cur = (cur + "\n" if cur else "") + f"（本次消息附带文件，已下载到本机）：\n{listing}"
+    blocks.append("【用户本次消息】\n" + (cur or "（无文字，仅有引用内容）"))
+
+    if reply_failed:
+        blocks.append(
+            "【用户通过飞书“回复”引用了一条消息，但读取失败】\n"
+            "请基于本次消息回答；必要时提示用户重新发送被引用的内容。"
+        )
+    else:
+        ref = replied_text or "（被引用消息没有文字内容）"
+        if replied_paths:
+            listing = "\n".join(f"- {p}" for p in replied_paths)
+            ref += f"\n\n引用消息中的文件已下载到本机：\n{listing}"
+        blocks.append(
+            "【用户通过飞书“回复”引用的内容（这是上下文，不是用户本次的新指令）】\n" + ref
+        )
+        if not current_text and (replied_text or replied_paths):
+            blocks.append("用户没有补充文字说明，请先解析/说明被引用的内容，再等待进一步指示。")
+    return "\n\n".join(blocks)
 
 
 def ask_agent(key: str, text: str, chat_id: str = "", chat_type: str = "",
@@ -934,7 +1038,9 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     if caption is None:  # 不支持的消息类型
         return
     text = caption
-    if not text and not attachments:  # 空消息
+    # 飞书“回复”引用关系：被回复消息的文本/图片/文件稍后在 worker 里拉取并合并进上下文
+    replied_mid = _replied_message_id(msg)
+    if not text and not attachments and not replied_mid:  # 空消息（且没有回复引用）
         return
 
     # 启动闸门：丢弃“桥启动之前产生”的消息。
@@ -1030,24 +1136,41 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
 
     where = "群聊" if chat_type == "group" else "私聊"
     desc = text or f"[{len(attachments)} 个附件]"
+    if replied_mid:
+        desc += "（含回复引用）"
     print(f"\n[{_ts()}] 📩 飞书（{where}）收到: {desc}")
 
     # chat_id / message_id 用默认参数绑定，杜绝闭包串扰
     # 直接喂用户原文：不告诉 Agent 它在飞书、不给 chat_id，它就不会想着自己发消息
     def worker(_key=key, _chat=chat_id, _mid=message_id, _text=text, _type=chat_type,
-               _atts=attachments, _model=per_msg_model, _agent=active_agent):
+               _atts=attachments, _model=per_msg_model, _agent=active_agent,
+               _replied_mid=replied_mid):
         agent_name = _agent_display_name(_agent)
         print(f"[{_ts()}] 🤔 {agent_name} 处理中……", flush=True)
         t0 = time.monotonic()
         reaction_id = _add_reaction(_mid)  # ⌨️ 正在输入中…
-        # 下载附件（图片/文件）到本地，把路径拼进提示词
+        # 下载当前消息附件（图片/文件）到本地，把路径拼进提示词
         paths: list[str] = []
         for att in _atts:
             p = _download_resource(_mid, att["file_key"], att["type"], att.get("name", ""))
             if p:
                 paths.append(p)
-        prompt = _build_media_prompt(_text, paths) if paths else _text
-        if not prompt:  # 附件全部下载失败、又无文字
+        # 飞书“回复”：拉取被回复消息，复用同一套解析/下载，作为引用上下文合并进 prompt
+        replied_text, replied_paths, reply_failed = "", [], False
+        if _replied_mid:
+            ref_msg = _fetch_message(_replied_mid)
+            if ref_msg is None:
+                reply_failed = True
+            else:
+                ref_text, ref_atts = _parse_message(ref_msg)
+                replied_text = ref_text or ""
+                ref_id = getattr(ref_msg, "message_id", _replied_mid)
+                for att in ref_atts:
+                    p = _download_resource(ref_id, att["file_key"], att["type"], att.get("name", ""))
+                    if p:
+                        replied_paths.append(p)
+        prompt = _build_agent_prompt(_text, paths, replied_text, replied_paths, reply_failed)
+        if not prompt:  # 附件全部下载失败、又无文字、又无引用
             prompt = "用户发来了附件但下载失败，请告知用户重发或换种方式。"
         # 流式回复：Claude 保持边生成边更新卡片；Codex 暂以最终回复兜底。
         streamer = (CardStreamer(_mid, _chat, STREAM_REPLY_INTERVAL)
@@ -1064,7 +1187,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                 reply_to(_mid, _chat, reply)
             print(f"[{_ts()}] 💬 {agent_name} 回复（耗时 {time.monotonic() - t0:.0f}s）:\n{reply}\n")
         finally:
-            for p in paths:  # 处理完清理下载的临时文件
+            for p in paths + replied_paths:  # 处理完清理下载的临时文件（含引用消息附件）
                 try:
                     os.remove(p)
                 except OSError:

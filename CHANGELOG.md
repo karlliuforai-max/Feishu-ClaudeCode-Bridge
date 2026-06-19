@@ -9,6 +9,18 @@
 
 暂无
 
+## [0.5.0] - 2026-06-19
+
+### 新增
+
+- 支持飞书「回复」引用上下文：当用户用「回复」引用另一条消息再 @ 机器人时，桥会读取被回复消息的文本与图片/文件，复用现有解析/下载逻辑，并在 prompt 中标注为「引用上下文（非本次新指令）」与「用户本次消息」分区交给 Agent。仅读直接父消息（`parent_id`），不递归展开回复链。
+- 被回复消息读取失败（已删除/无权限/网络异常）时 fail-soft：当前消息照常处理，prompt 追加一句读取失败说明，不阻断、不崩溃。
+- 「仅回复引用、本次无正文无附件」也会触发（例如回复一个文件 + 只 @ 机器人）。
+
+### 变更
+
+- 正文里的 @ 不再整体删除：`@_user_N` 占位符按 `mentions[].name` 渲染成可读的 `@姓名`，保留「@的是本机器人 / 他人 / 别的机器人」这层信息；拿不到名字的占位符仍删掉，不漏出 `@_user_N`。`text` 与富文本 `post` 两条解析路径同步生效。
+
 ## [0.4.1] - 2026-06-18
 
 ### 修复
@@ -223,7 +235,8 @@
 
 - 新增 `requirements.txt` 锁定依赖 `lark-oapi>=1.4`。
 
-[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/karlliuforai-max/Feishu-ClaudeCode-Bridge/compare/v0.2.2...v0.3.0

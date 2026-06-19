@@ -177,6 +177,120 @@ class BridgeCoreTests(BridgeTestCase):
             self.bridge.urllib.request.urlopen = original_urlopen
             self.bridge.MAX_ATTACHMENT_BYTES = original_limit
 
+    def test_resolve_mentions_keeps_names_instead_of_deleting(self):
+        SN = SimpleNamespace
+        mentions = [SN(key="@_user_1", name="PigKarl"), SN(key="@_user_2", name="张三")]
+        self.assertEqual(
+            self.bridge._resolve_mentions("@_user_1 帮我看 @_user_2 的方案", mentions),
+            "@PigKarl 帮我看 @张三 的方案",
+        )
+        # 没有名字的占位符仍然删掉，不漏 @_user_N
+        self.assertEqual(
+            self.bridge._resolve_mentions("hi @_user_9 there", [SN(key="@_user_9", name="")]),
+            "hi there",
+        )
+        # 完全没有 mentions 信息时回退为删除占位符（不残留 @_user_N）
+        self.assertEqual(self.bridge._resolve_mentions("hi @_user_1", None), "hi")
+
+    def test_parse_text_message_renders_mention_names(self):
+        msg = SimpleNamespace(
+            message_type="text",
+            content=json.dumps({"text": "@_user_1 你好 @_user_2"}),
+            mentions=[
+                SimpleNamespace(key="@_user_1", name="机器人"),
+                SimpleNamespace(key="@_user_2", name="老王"),
+            ],
+        )
+        text, attachments = self.bridge._parse_message(msg)
+        self.assertEqual(text, "@机器人 你好 @老王")
+        self.assertEqual(attachments, [])
+
+    def test_replied_message_id_reads_direct_parent_only(self):
+        self.assertEqual(
+            self.bridge._replied_message_id(SimpleNamespace(parent_id="om_p")), "om_p"
+        )
+        self.assertIsNone(self.bridge._replied_message_id(SimpleNamespace(parent_id="")))
+        self.assertIsNone(self.bridge._replied_message_id(SimpleNamespace(parent_id=None)))
+        self.assertIsNone(self.bridge._replied_message_id(SimpleNamespace()))
+
+    def test_build_agent_prompt_without_reply_falls_back(self):
+        # 无引用、纯文本：原样返回
+        self.assertEqual(self.bridge._build_agent_prompt("hi", []), "hi")
+        # 无引用、有当前附件：退回 _build_media_prompt 行为
+        p = self.bridge._build_agent_prompt("看图", ["/tmp/a.png"])
+        self.assertIn("/tmp/a.png", p)
+        self.assertIn("用户附言：看图", p)
+
+    def test_build_agent_prompt_with_replied_text_and_file(self):
+        p = self.bridge._build_agent_prompt(
+            "帮我整理", [], replied_text="会议记录原文", replied_paths=["/tmp/ref.pdf"]
+        )
+        self.assertIn("【用户本次消息】", p)
+        self.assertIn("帮我整理", p)
+        self.assertIn("引用的内容", p)
+        self.assertIn("会议记录原文", p)
+        self.assertIn("/tmp/ref.pdf", p)
+
+    def test_build_agent_prompt_reply_failed_adds_note(self):
+        p = self.bridge._build_agent_prompt("看一下", [], reply_failed=True)
+        self.assertIn("读取失败", p)
+        self.assertIn("看一下", p)
+
+    def test_build_agent_prompt_reply_file_only_without_current_text(self):
+        p = self.bridge._build_agent_prompt("", [], replied_paths=["/tmp/ref.pdf"])
+        self.assertIn("无文字", p)
+        self.assertIn("/tmp/ref.pdf", p)
+        self.assertIn("请先解析", p)
+
+    def test_fetch_message_failure_keeps_current_message(self):
+        class FakeResp:
+            code = 230002
+            msg = "no permission"
+
+            def success(self):
+                return False
+
+        original = self.bridge.client
+        self.bridge.client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(message=SimpleNamespace(get=lambda req: FakeResp()))
+            )
+        )
+        try:
+            with redirect_stdout(io.StringIO()):
+                self.assertIsNone(self.bridge._fetch_message("om_missing"))
+        finally:
+            self.bridge.client = original
+
+    def test_fetch_message_success_is_reusable_by_parse_message(self):
+        fake_item = SimpleNamespace(
+            message_id="om_parent",
+            msg_type="text",
+            body=SimpleNamespace(content=json.dumps({"text": "原始想法 @_user_1"})),
+            mentions=[SimpleNamespace(key="@_user_1", name="老王")],
+        )
+
+        class FakeResp:
+            data = SimpleNamespace(items=[fake_item])
+
+            def success(self):
+                return True
+
+        original = self.bridge.client
+        self.bridge.client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(message=SimpleNamespace(get=lambda req: FakeResp()))
+            )
+        )
+        try:
+            ref = self.bridge._fetch_message("om_parent")
+            self.assertIsNotNone(ref)
+            text, attachments = self.bridge._parse_message(ref)
+            self.assertEqual(text, "原始想法 @老王")
+            self.assertEqual(attachments, [])
+        finally:
+            self.bridge.client = original
+
     def test_streaming_card_json_uses_element_id_and_streaming_mode(self):
         card = json.loads(self.bridge._streaming_card_json("hi"))
         self.assertTrue(card["config"]["streaming_mode"])
