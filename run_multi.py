@@ -19,9 +19,10 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 BRIDGE = BASE_DIR / "src" / "feishu_agent_bridge.py"
-# 与 run_bridge.command 一致：这些退出码重启也无济于事，不再拉起。
-# 0=正常 130=Ctrl-C 1=配置等致命错误 127=找不到解释器
-NO_RESTART_CODES = {0, 1, 130, 127}
+# 与 run_bridge.* 一致：这些退出码重启也无济于事，不再拉起。
+# 0=正常 2=配置/依赖致命错误(config.CONFIG_ERROR_EXIT) 130=Ctrl-C 127=找不到解释器。
+# 注意：未捕获异常/网络层崩溃退出码是 1，不在此列——那才是要自动重启的「崩溃」。
+NO_RESTART_CODES = {0, 2, 130, 127}
 RESTART_DELAY = 3
 
 _children: set[subprocess.Popen] = set()

@@ -96,6 +96,7 @@ from config import (
     APP_SECRET,
     CLAUDE_MODEL,
     CODEX_MODEL,
+    CONFIG_ERROR_EXIT,
     DEFAULT_AGENT,
     INBOX_DIR,
     MAX_ATTACHMENT_BYTES,
@@ -111,7 +112,7 @@ from config import (
     _ts,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 # 进程启动时刻（毫秒）。尽早记录，避免启动期的网络探测把新消息误判成旧事件。
 START_TIME_MS = time.time() * 1000
 
@@ -129,17 +130,12 @@ _SESSION_MODELS: dict[str, str] = {}
 def _get_bot_open_id() -> str | None:
     """取 bot 自身 open_id，用于精确判断群里是否 @ 了机器人。"""
     try:
+        token = _get_tenant_token()  # 复用带缓存的 tenant token，别再单独换一次
         req = urllib.request.Request(
-            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-            data=json.dumps({"app_id": APP_ID, "app_secret": APP_SECRET}).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        tok = json.loads(urllib.request.urlopen(req, timeout=15).read())["tenant_access_token"]
-        req2 = urllib.request.Request(
             "https://open.feishu.cn/open-apis/bot/v3/info",
-            headers={"Authorization": "Bearer " + tok},
+            headers={"Authorization": "Bearer " + token},
         )
-        info = json.loads(urllib.request.urlopen(req2, timeout=15).read())
+        info = json.loads(urllib.request.urlopen(req, timeout=15).read())
         return (info.get("bot") or {}).get("open_id")
     except Exception as e:  # noqa: BLE001
         print(f"[warn] 取 bot open_id 失败，群聊将暂不响应 @ 以避免误触发：{e}")
@@ -356,17 +352,16 @@ def _reset_agent_session(key: str, agent: str | None = None,
     return active
 
 
-def _get_or_create_agent_sid(key: str, agent: str, chat_id: str = "",
-                             chat_type: str = "") -> tuple[str, bool]:
+def _peek_or_new_agent_sid(key: str, agent: str, chat_id: str = "",
+                           chat_type: str = "") -> tuple[str, bool]:
+    """取已有会话 sid；没有则生成一个新 uuid 但【不落盘】。
+    落盘推迟到 agent 真正跑成功之后（见 ask_agent）——否则首轮失败会留下一个 claude 侧
+    根本不存在的 sid，之后每条消息都 --resume 它而永久报错，直到用户手动 /new。"""
     agent = _normalize_agent(agent)
     sid = _get_agent_sid(key, agent, chat_id, chat_type)
     if sid:
         return sid, False
-    sid = str(uuid.uuid4())
-    _save_agent_sid(key, agent, sid, chat_id, chat_type)
-    rec = _ensure_session_record(key, chat_id, chat_type)
-    print(f"[{_ts()}] 🆕 开启新 {agent} 会话（{rec.get('chat_name') or '私聊'}）")
-    return sid, True
+    return str(uuid.uuid4()), True
 
 
 # ---------- Agent 状态/模型展示 ----------
@@ -708,6 +703,7 @@ class CardStreamer:
         self.interval = max(0.2, interval)
         self.card_id: str | None = None
         self.failed = False
+        self.fail_count = 0
         self.buf = ""
         self.seq = 0
         self.last_push = 0.0
@@ -750,8 +746,14 @@ class CardStreamer:
                 return
             if not self._ensure_card():
                 return
+            # 无论成败都推进 last_push，避免更新失败后每个增量都立刻重试、把限频彻底打穿
+            self.last_push = now
             if self._update(self.buf):
-                self.last_push = now
+                self.fail_count = 0
+            else:
+                self.fail_count += 1
+                if self.fail_count >= 3:  # 连续失败：放弃流式，交回 finish / 普通 reply 兜底
+                    self.failed = True
 
     def finish(self, final_text: str) -> bool:
         """收尾。返回 True=已通过卡片完成发送；False=请调用方退回普通 reply_to。"""
@@ -769,7 +771,10 @@ class CardStreamer:
             cleaned, img_paths = _extract_images(text)
             if not self._ensure_card():  # 整段未能建卡 → 退回普通回复
                 return False
-            self._update(cleaned or "(无文本输出)")
+            if not self._update(cleaned or "(无文本输出)"):
+                # 最终内容没刷上去（网络抖动 / 文本超长）→ 退回普通 reply_to 完整重发，
+                # 否则用户只会看到流式过程中截断的半截回复。
+                return False
             _cardkit_request(f"{_CARDKIT_BASE}/{self.card_id}/settings",
                              {"settings": json.dumps({"config": {"streaming_mode": False}}),
                               "sequence": self._next_seq(), "uuid": uuid.uuid4().hex},
@@ -1009,7 +1014,7 @@ def ask_agent(key: str, text: str, chat_id: str = "", chat_type: str = "",
     agent_name = _normalize_agent(agent) if agent else _get_active_agent(key, chat_id, chat_type)
     impl = get_agent(agent_name)
     if impl.pregenerate_sid:
-        sid, is_new = _get_or_create_agent_sid(key, agent_name, chat_id, chat_type)
+        sid, is_new = _peek_or_new_agent_sid(key, agent_name, chat_id, chat_type)
     else:  # CLI 自管会话 id（codex）：传入已有 sid 或 None
         sid = _get_agent_sid(key, agent_name, chat_id, chat_type)
         is_new = sid is None
@@ -1017,10 +1022,19 @@ def ask_agent(key: str, text: str, chat_id: str = "", chat_type: str = "",
     eff_model = (model or _SESSION_MODELS.get(key, "")) if impl.supports_model_switch else ""
     cb = text_delta_cb if impl.supports_stream_reply else None
     result = impl.run(prompt=text, sid=sid, is_new=is_new, model=eff_model, text_delta_cb=cb)
-    if result.new_sid and result.new_sid != sid:
-        _save_agent_sid(key, agent_name, result.new_sid, chat_id, chat_type)
-    elif not impl.pregenerate_sid and sid is None and not result.new_sid:
-        print(f"[warn] {impl.display_name} 未返回 session_id，本轮回复可用但无法持久续接")
+    if impl.pregenerate_sid:
+        # claude：sid 由我们预生成并传入。只有 run 成功(返回 new_sid)才落盘；失败时新会话
+        # 不落盘 → 下轮自动重开，不会把死 sid 固化下来。已有会话续接失败也不动原 sid。
+        if result.new_sid:
+            if is_new:
+                _save_agent_sid(key, agent_name, result.new_sid, chat_id, chat_type)
+                rec = _ensure_session_record(key, chat_id, chat_type)
+                print(f"[{_ts()}] 🆕 开启新 {agent_name} 会话（{rec.get('chat_name') or '私聊'}）")
+    else:  # codex：CLI 自管会话 id，返回什么就存什么
+        if result.new_sid and result.new_sid != sid:
+            _save_agent_sid(key, agent_name, result.new_sid, chat_id, chat_type)
+        elif sid is None and not result.new_sid:
+            print(f"[warn] {impl.display_name} 未返回 session_id，本轮回复可用但无法持久续接")
     return result.reply
 
 
@@ -1181,12 +1195,20 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                 reply = ask_agent(
                     _key, prompt, _chat, _type, text_delta_cb=delta_cb, model=_model, agent=_agent
                 )
-            if reaction_id:
-                _del_reaction(_mid, reaction_id)
             if not (streamer and streamer.finish(reply)):
                 reply_to(_mid, _chat, reply)
             print(f"[{_ts()}] 💬 {agent_name} 回复（耗时 {time.monotonic() - t0:.0f}s）:\n{reply}\n")
+        except Exception as e:  # noqa: BLE001
+            # ask_agent 内部已兜住大多数错误并返回文案；这里再兜住持久化/发送等意外异常，
+            # 否则 worker 线程会静默死亡：用户消息上的 Typing 表情一直挂着、又收不到任何回复。
+            print(f"[{_ts()}] ❌ worker 异常：{e}")
+            try:
+                reply_to(_mid, _chat, f"❌ 处理出错：{e}")
+            except Exception as e2:  # noqa: BLE001
+                print(f"[reply 兜底也失败] {e2}")
         finally:
+            if reaction_id:  # 无论成功还是异常，都要摘掉 Typing 表情
+                _del_reaction(_mid, reaction_id)
             for p in paths + replied_paths:  # 处理完清理下载的临时文件（含引用消息附件）
                 try:
                     os.remove(p)
@@ -1200,6 +1222,50 @@ def _ignore_event(data) -> None:
     """空处理器：吞掉 bot 自己加 Typing reaction 触发的回推事件，
     否则 lark SDK 找不到 processor 会刷 ERROR 日志（无害但噪音）。"""
     return None
+
+
+# Agent 行为约束：写进每个 workspace 根目录，codex 读 AGENTS.md、claude 读 CLAUDE.md，
+# 都会在启动会话时自动加载。核心目的是把「正规发送通道」告诉 Agent，堵住它自己调
+# 本机全局 lark-cli / 飞书 API 发消息——那会以错误的应用身份把内容发到别的企业/群。
+_AGENT_GUIDE = """# 网关运行约定（务必遵守）
+
+你运行在一个「飞书 ↔ Agent 网关」后面。用户在飞书里发消息，网关把**纯文本与附件**转给你，
+再把你的回复发回消息**来源的那个会话**。你不知道、也不需要知道消息来自哪个飞书应用/群/企业——
+网关会用正确的来源身份替你投递。
+
+## 发图片 / 文件
+不要自己发送。只需在回复正文里，**单独一行**写：
+
+    <<<IMG>>>/绝对/路径/图片.png
+
+（或 markdown 形式 `![](/绝对/路径/图片.png)`）。网关会自动上传并作为图片消息发到来源会话。
+
+## 绝对禁止
+- 禁止调用任何飞书 OpenAPI、`lark-cli`、`lark-*` skills，或用 curl/python 直接请求飞书接口来
+  **发消息 / 查群 / 查通讯录 / 查会话**。
+- 原因：本机这些工具是以「登录它的那个应用 + 个人」的**全局身份**运行的，跟当前消息来自哪个
+  应用无关。你一旦这么做，就会用**错误的身份**把内容发到**别的企业、别的群**，造成跨企业信息泄漏。
+
+你只负责**返回文本**（含上面的 `<<<IMG>>>` 图片指令），投递与身份的事全部交给网关。
+"""
+
+
+def _write_agent_guides() -> None:
+    """把网关行为约定写进 WORKDIR 根：AGENTS.md(codex) 与 CLAUDE.md(claude) 自动加载。
+    内容无变化则不重写，避免无谓触发文件监听。"""
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        path = os.path.join(WORKDIR, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                if f.read() == _AGENT_GUIDE:
+                    continue
+        except OSError:
+            pass
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(_AGENT_GUIDE)
+        except OSError as e:
+            print(f"[warn] 写入 {name} 失败（忽略）：{e}")
 
 
 def _clean_inbox() -> None:
@@ -1234,8 +1300,11 @@ handler = _dispatch.build()
 
 if __name__ == "__main__":
     if not LARK_AVAILABLE:
-        raise SystemExit("❌ 缺少依赖 lark-oapi，请先运行: pip install -r requirements.txt")
+        # 依赖缺失属「重启也没用」的致命错误：用专用退出码，让守护器不再反复拉起。
+        print("❌ 缺少依赖 lark-oapi，请先运行: pip install -r requirements.txt")
+        raise SystemExit(CONFIG_ERROR_EXIT)
     _clean_inbox()
+    _write_agent_guides()
     print(f"✅ 飞书 Agent Gateway v{__version__} 已就绪，正在连接飞书……")
     print(f"   默认 Agent：{_agent_display_name(DEFAULT_AGENT)}；Claude={CLAUDE_MODEL}；Codex={CODEX_MODEL}")
     print(f"   工作目录(workspace)：{WORKDIR}")

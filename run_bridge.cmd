@@ -71,8 +71,10 @@ echo.
 set "EXIT_CODE=%ERRORLEVEL%"
 
 echo.
+rem No-restart codes: 0=normal 2=fatal config/deps 130=Ctrl-C 9009=python not found.
+rem Code 1 (unhandled crash / network layer) is NOT here on purpose: that one auto-restarts.
 if "%EXIT_CODE%"=="0" goto stopped
-if "%EXIT_CODE%"=="1" goto stopped
+if "%EXIT_CODE%"=="2" goto stopped
 if "%EXIT_CODE%"=="130" goto stopped
 if "%EXIT_CODE%"=="9009" goto stopped
 

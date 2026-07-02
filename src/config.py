@@ -13,6 +13,7 @@
 import json
 import os
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 
@@ -116,6 +117,18 @@ def _ts() -> str:
     return time.strftime("%H:%M:%S")
 
 
+# 配置/依赖等「致命且重启也没用」的错误用这个退出码，与运行时崩溃(Python 默认 1)区分开：
+# run_multi.py / run_bridge.* 守护器见到它就不再拉起；见到 1（未捕获异常/网络层崩溃）才当
+# 崩溃自动重启。历史上两者都用 1，导致真正的崩溃反而不重启——这里拆开。
+CONFIG_ERROR_EXIT = 2
+
+
+def _fatal_config(msg: str):
+    """打印致命配置错误并以专用退出码退出（守护器不会重启这种退出）。"""
+    print(msg, file=sys.stderr, flush=True)
+    raise SystemExit(CONFIG_ERROR_EXIT)
+
+
 # ---------- 加载 config.json ----------
 # 所有可变项集中在项目根目录的 config.json（不入库，见 README「配置」）。
 # 只有 app_id / app_secret 必填，其余缺省即可。可用 BRIDGE_CONFIG 指定别的路径。
@@ -126,7 +139,7 @@ try:
     with open(CONFIG_FILE, encoding="utf-8") as _f:
         _conf = json.load(_f)
 except FileNotFoundError:
-    raise SystemExit(
+    _fatal_config(
         f"❌ 缺少配置文件: {CONFIG_FILE}\n"
         f'   请按 README 创建，至少包含飞书应用凭证：\n'
         f'   {{"app_id": "cli_xxx", "app_secret": "xxxxxx"}}'
@@ -140,14 +153,14 @@ APP_SECRET = _conf["app_secret"]
 VALID_AGENTS = {"claude", "codex"}
 DEFAULT_AGENT = str(_conf.get("default_agent", "claude")).strip().lower()
 if DEFAULT_AGENT not in VALID_AGENTS:
-    raise SystemExit("❌ 配置错误: default_agent 只能是 claude 或 codex")
+    _fatal_config("❌ 配置错误: default_agent 只能是 claude 或 codex")
 
 # claude -p 使用的默认模型 ID
 CLAUDE_MODEL = _conf.get("model", "claude-sonnet-4-6")
 # Codex 固定单模型，避免与 Claude 的 /model 体系混在一起。
 CODEX_MODEL = str(_conf.get("codex_model", "gpt-5.5")).strip()
 if CODEX_MODEL != "gpt-5.5":
-    raise SystemExit("❌ 配置错误: 当前版本的 codex_model 只能是 gpt-5.5")
+    _fatal_config("❌ 配置错误: 当前版本的 codex_model 只能是 gpt-5.5")
 CODEX_SANDBOX = str(_conf.get("codex_sandbox", "workspace-write")).strip() or "workspace-write"
 CODEX_SKIP_GIT_REPO_CHECK = _as_bool(_conf.get("codex_skip_git_repo_check"), True)
 CLAUDE_BIN = _cli_bin(_conf.get("claude_bin"), "claude")
@@ -245,14 +258,15 @@ SESSIONS_FILE = os.path.join(STATE_DIR, "sessions.json")
 INBOX_DIR = os.path.join(WORKDIR, "inbox")
 
 # ---------- 其它运行参数 ----------
-CLAUDE_TIMEOUT = int(_conf.get("timeout", 600))
+# 单次 agent 调用（claude -p / codex exec）的墙钟超时，秒。config 键仍叫 timeout。
+AGENT_TIMEOUT = int(_conf.get("timeout", 600))
 MAX_ATTACHMENT_BYTES = int(_conf.get("max_attachment_bytes", 25 * 1024 * 1024))
 if MAX_ATTACHMENT_BYTES <= 0:
-    raise SystemExit("❌ 配置错误: max_attachment_bytes 必须大于 0")
+    _fatal_config("❌ 配置错误: max_attachment_bytes 必须大于 0")
 STREAM_TERMINAL = _as_bool(_conf.get("stream_terminal"), True)
 TERMINAL_STREAM_FORMAT = str(_conf.get("terminal_stream_format", "text")).strip().lower()
 if TERMINAL_STREAM_FORMAT not in {"text", "json"}:
-    raise SystemExit("❌ 配置错误: terminal_stream_format 只能是 text 或 json")
+    _fatal_config("❌ 配置错误: terminal_stream_format 只能是 text 或 json")
 # 流式回复：开启后用飞书 CardKit 流式卡片「边生成边更新」，让用户实时看到 Claude 打字。
 # 默认关闭：保留稳妥的「生成完一次性回复」路径作为兜底，任一环节失败都会自动退回普通回复。
 STREAM_REPLY = _as_bool(_conf.get("stream_reply"), False)
@@ -264,9 +278,12 @@ STREAM_REPLY_INTERVAL = float(_conf.get("stream_reply_interval", 0.7))
 #   user            按人分，不区分群/私聊（同一人的群与私聊会并成一个上下文）
 SESSION_SCOPE = _conf.get("session_scope", "chat_user")
 # 预授权工具，避免无头模式卡在看不见的授权框。可在 config.json 里写字符串或数组。
-# 默认不含 Bash：从能力上断掉 Claude 自己 curl 飞书 API 发消息（这是“发错群”的根因）。
+# 默认既不含 Bash 也不含 Skill：本机全局 lark-cli / lark-* skills 是以「登录 lark-cli
+# 的那个应用+个人」身份说话的，与消息来自哪个飞书应用无关。若放开，Agent 会绕过网关、
+# 用错误身份查群 / 发消息，把 A 企业的图片发到 B 企业的群——这是跨企业信息泄漏的根因。
+# 发图请让 Agent 走 <<<IMG>>> 协议（见 feishu_agent_bridge），由网关以来源应用身份回发。
 _tools = _conf.get("allowed_tools",
-                   "Read Write Edit Glob Grep WebSearch WebFetch Skill TodoWrite Task")
+                   "Read Write Edit Glob Grep WebSearch WebFetch TodoWrite Task")
 ALLOWED_TOOLS = _tools.split() if isinstance(_tools, str) else list(_tools)
 RESET_CMDS = {"/new", "/reset", "/新会话", "新会话", "重置会话"}
 

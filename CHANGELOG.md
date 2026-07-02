@@ -9,6 +9,29 @@
 
 暂无
 
+## [0.5.1] - 2026-07-02
+
+### 安全
+
+- 收敛 Agent 可用能力，堵住一类跨企业信息泄漏：本机全局 `lark-cli` / `lark-*` skills 是以「登录它的那个应用 + 个人」的身份说话的，与消息来自哪个飞书应用无关；一旦放开，Agent 会绕过网关、用**错误身份**查群 / 发消息，把 A 企业的内容发到 B 企业的群。为此：默认 `allowed_tools` 移除 `Skill`（示例 `config.example.json` 同步），并在注释中说明原因。各应用真实 config（`configs/*.json`，不入库）需自行把 `codex_sandbox` 收回 `workspace-write`、从 `allowed_tools` 移除 `Bash(lark-cli:*)`。
+- 启动时向每个应用的 workspace 根写入 `AGENTS.md`（codex 读）/ `CLAUDE.md`（claude 读）：明确告知 Agent 只需返回文本、发图走 `<<<IMG>>>路径` 协议由网关以来源应用身份回发，**禁止**自行调用飞书 OpenAPI / `lark-cli` / `lark-*` skills 发消息或查群。
+
+### 修复
+
+- 「崩溃自动重启」此前形同虚设：配置错误与未捕获崩溃都以退出码 `1` 退出、被守护器一并列入「不重启」。现在配置 / 依赖等致命错误改用专用退出码 `2`（`config.CONFIG_ERROR_EXIT`），只有真正的崩溃（`1`）才会被 `run_multi.py` / `run_bridge.command` / `run_bridge.cmd` 自动拉起。
+- Claude 首轮失败（超时等）不再固化一个 claude 侧根本不存在的 session id：会话 sid 改为「run 成功后才落盘」，避免此后每条消息都 `--resume` 一个死会话而持续报错，直到用户手动 `/new`。
+- worker 线程新增异常兜底：持久化 / 发送等意外异常不再让线程静默死亡（导致 Typing 表情永久悬挂、用户收不到任何回复），改为回一条错误提示并**必定**清除 Typing 表情。
+- 流式卡片「最终一次内容刷新」失败时，`finish` 退回普通回复完整重发，避免用户只看到流式过程中截断的半截内容。
+- Codex 沙箱在首轮（`exec`）与续接（`exec resume`）上保持一致：统一改用全局配置覆盖 `-c sandbox_mode=...`（`resume` 子命令不认 `--sandbox`），消除续轮悄悄退回默认沙箱造成的权限漂移。
+
+### 变更
+
+- 流式卡片更新连续失败时自动退避并转兜底，且失败也推进限频时间戳，避免打穿飞书 CardKit 限频。
+- claude text 流按块读取（`read(4096)`）替代逐字符 `read(1)`，减少长回复下的无谓开销。
+- `_get_bot_open_id` 复用带缓存的 tenant token，不再单独多换一次。
+- 内部超时常量 `CLAUDE_TIMEOUT` 更名 `AGENT_TIMEOUT`（对 claude / codex 都生效，配置键 `timeout` 不变）。
+- `.vscode/` 纳入 `.gitignore`。
+
 ## [0.5.0] - 2026-06-19
 
 ### 新增

@@ -14,6 +14,7 @@ htmlcov/
 logs/
 .bridge_state/
 .claude/settings.local.json
+.vscode/
 # agent 工作区：下载的附件与生成的文件都在这里，整目录不上库
 workspace/
 .inbox/

@@ -28,9 +28,9 @@ from config import (
     AGENT_CONFIGS,
     AgentConfig,
     ALLOWED_TOOLS,
+    AGENT_TIMEOUT,
     CLAUDE_BIN,
     CLAUDE_MODEL,
-    CLAUDE_TIMEOUT,
     CODEX_BIN,
     CODEX_MODEL,
     CODEX_SANDBOX,
@@ -58,8 +58,10 @@ def _pipe_to_queue(pipe, stream_name: str, out_q: "queue.Queue[tuple[str, str]]"
                 for chunk in iter(pipe.readline, ""):
                     out_q.put((stream_name, chunk))
             else:
+                # 非逐行档（claude text 流）：按块读，下游只是拼接/回显，逐字符 read(1)
+                # 会对一段长回复做上万次 queue.put，纯属浪费。
                 while True:
-                    chunk = pipe.read(1)
+                    chunk = pipe.read(4096)
                     if not chunk:
                         break
                     out_q.put((stream_name, chunk))
@@ -315,7 +317,7 @@ def _build_claude_cmd(text: str, sid: str, is_new: bool, output_format: str = "t
 def _run_claude_buffered(cmd: list[str]) -> str:
     r = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=CLAUDE_TIMEOUT, cwd=WORKDIR, stdin=subprocess.DEVNULL
+        timeout=AGENT_TIMEOUT, cwd=WORKDIR, stdin=subprocess.DEVNULL
     )
     out = (r.stdout or "").strip()
     return out or _fallback_no_output(r.stderr or "")
@@ -349,7 +351,7 @@ def _run_claude_streaming(cmd: list[str], stream_format: str, tag: str = "",
                 if stream_format == "json" else None)
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
-    deadline = time.monotonic() + CLAUDE_TIMEOUT
+    deadline = time.monotonic() + AGENT_TIMEOUT
     timed_out = False
 
     while True:
@@ -387,7 +389,7 @@ def _run_claude_streaming(cmd: list[str], stream_format: str, tag: str = "",
         t.join(timeout=1)
 
     if timed_out:
-        raise subprocess.TimeoutExpired(cmd, CLAUDE_TIMEOUT)
+        raise subprocess.TimeoutExpired(cmd, AGENT_TIMEOUT)
 
     if terminal_echo:
         print(f"\n[{_ts()}] ■ Claude 流结束 [{tag}]", flush=True)
@@ -399,12 +401,21 @@ def _run_claude_streaming(cmd: list[str], stream_format: str, tag: str = "",
 def _build_codex_cmd(text: str, sid: str | None, output_file: str,
                      model: str = "") -> list[str]:
     model = model or CODEX_MODEL
+    # 沙箱要在首轮(exec)与续接(exec resume)上完全一致，否则同一会话前后权限会漂移。
+    # 坑：--sandbox 只在 exec 首轮可用，resume 子命令不认它，只在首轮传会让 resume 轮悄悄退回
+    # Codex 默认沙箱。因此统一改用全局配置覆盖 -c sandbox_mode=...，它对 exec 与 resume 都生效。
+    # danger-full-access 档用 --dangerously-bypass-approvals-and-sandbox（同时关审批+沙箱，让
+    # Codex 能读写任意本地文件并自由联网），该标志两个子命令也都支持。
+    full_access = CODEX_SANDBOX == "danger-full-access"
+    sandbox_args = (["--dangerously-bypass-approvals-and-sandbox"] if full_access
+                    else ["-c", f'sandbox_mode="{CODEX_SANDBOX}"'])
     if sid:
         cmd = [
             CODEX_BIN, "exec", "resume",
             "--json",
             "--output-last-message", output_file,
             "--model", model,
+            *sandbox_args,
         ]
         if CODEX_SKIP_GIT_REPO_CHECK:
             cmd.append("--skip-git-repo-check")
@@ -417,7 +428,7 @@ def _build_codex_cmd(text: str, sid: str | None, output_file: str,
         "--output-last-message", output_file,
         "--model", model,
         "--cd", WORKDIR,
-        "--sandbox", CODEX_SANDBOX,
+        *sandbox_args,
     ]
     if CODEX_SKIP_GIT_REPO_CHECK:
         cmd.append("--skip-git-repo-check")
@@ -534,7 +545,7 @@ def _run_codex_streaming(cmd: list[str], output_file: str, tag: str = "",
     error_messages: list[str] = []
     failed = False
     session_id = None
-    deadline = time.monotonic() + CLAUDE_TIMEOUT
+    deadline = time.monotonic() + AGENT_TIMEOUT
     timed_out = False
 
     while True:
@@ -581,7 +592,7 @@ def _run_codex_streaming(cmd: list[str], output_file: str, tag: str = "",
         t.join(timeout=1)
 
     if timed_out:
-        raise subprocess.TimeoutExpired(cmd, CLAUDE_TIMEOUT)
+        raise subprocess.TimeoutExpired(cmd, AGENT_TIMEOUT)
 
     try:
         with open(output_file, encoding="utf-8") as f:
@@ -658,7 +669,9 @@ class ClaudeAgent(Agent):
                 reply = _run_claude_buffered(cmd)
             return AgentResult(reply=reply, new_sid=sid)
         except subprocess.TimeoutExpired:
-            return AgentResult(reply="⌛ 处理超时了，换个更具体的问题再试。", new_sid=sid)
+            # 不回传 new_sid：首轮超时时会话可能根本没在 claude 侧建立，若把预生成 sid 落盘，
+            # 之后每条消息都会 --resume 一个不存在的会话而永久报错。留空让本轮不落盘、下轮重开。
+            return AgentResult(reply="⌛ 处理超时了，换个更具体的问题再试。")
         except FileNotFoundError:
             return AgentResult(reply=_cli_missing_message("Claude", self.cfg.bin, "claude_bin"))
         except Exception as e:  # noqa: BLE001

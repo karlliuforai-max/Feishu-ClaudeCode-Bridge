@@ -304,6 +304,49 @@ class BridgeCoreTests(BridgeTestCase):
         handled = st.finish(self.bridge._CARD_MARKER + '{"schema":"2.0"}')
         self.assertFalse(handled)
 
+    def test_card_streamer_finish_falls_back_when_final_update_fails(self):
+        # 最终一次内容刷新失败 → finish 必须返回 False，让调用方退回普通 reply_to 完整重发，
+        # 否则用户只会看到流式过程中截断的半截回复。
+        st = self.bridge.CardStreamer("msg/1", "oc_x")
+        st.card_id = "card-1"          # 假装卡片已建好
+        st._update = lambda _content: False   # 模拟最终 PUT 失败
+        self.assertFalse(st.finish("完整的最终回复"))
+
+    def test_claude_sid_not_persisted_until_run_succeeds(self):
+        key = "k-sid-defer"
+        AR = self.agents.AgentResult
+        claude = self.bridge.get_agent("claude")
+        orig_run = claude.run
+        self.bridge.SESSIONS.pop(key, None)
+        seen = {}
+
+        def ok_run(**kw):
+            seen["sid"], seen["is_new"] = kw["sid"], kw["is_new"]
+            return AR(reply="done", new_sid=kw["sid"])  # 成功：回传传入的 sid
+
+        try:
+            with redirect_stdout(io.StringIO()):
+                # 首轮失败：run 不回传 new_sid → 死 sid 不落盘
+                claude.run = lambda **kw: AR(reply="boom", new_sid=None)
+                self.bridge.ask_agent(key, "hi")
+                self.assertIsNone(self.bridge._get_agent_sid(key, "claude"))
+
+                # 成功一轮：落盘，且这一轮是 is_new
+                claude.run = ok_run
+                self.bridge.ask_agent(key, "hi again")
+                saved = self.bridge._get_agent_sid(key, "claude")
+                self.assertEqual(saved, seen["sid"])
+                self.assertTrue(seen["is_new"])
+
+                # 再一轮：作为已有会话续接，sid 复用、is_new=False
+                self.bridge.ask_agent(key, "third")
+                self.assertFalse(seen["is_new"])
+                self.assertEqual(seen["sid"], saved)
+        finally:
+            claude.run = orig_run
+            self.bridge.SESSIONS.pop(key, None)
+            self.bridge._save_sessions()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,7 @@
 
 本项目遵循语义化版本。
 
-当前版本是 `v0.5.0`。
+当前版本是 `v0.5.1`。
 
 ## 版本来源
 
@@ -15,7 +15,7 @@ src/feishu_agent_bridge.py
 当前变量：
 
 ```python
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 ```
 
 ## 发布策略
@@ -25,6 +25,8 @@ __version__ = "0.5.0"
 - Patch：缺陷修复和不改变行为的维护。
 - Minor：向后兼容的新能力。
 - Major：配置、状态、命令或部署方式存在不兼容变更。
+
+v0.5.1 属于 Patch：健壮性缺陷修复 + 安全加固，不改配置结构、命令语义或 session 状态结构，无需迁移。修复「崩溃自动重启形同虚设」（配置致命错误改用退出码 `2`，崩溃 `1` 才重启）、「Claude 首轮失败固化死 session id」（成功后才落盘）、「worker 线程静默死亡」（异常兜底 + 必清 Typing 表情）、「流式卡片最终刷新失败只发半截」（退回完整重发）、「Codex 沙箱首轮与 resume 不一致」（统一 `-c sandbox_mode` 覆盖）。安全上收敛默认 `allowed_tools`（移除 `Skill`）并新增启动写入的 `AGENTS.md` / `CLAUDE.md` 行为约定，堵住 Agent 用本机全局身份跨企业发消息 / 查群的信息泄漏路径。注：各应用真实 `configs/*.json`（不入库）的 `codex_sandbox` / `allowed_tools` 收敛需自行同步。
 
 v0.5.0 属于 Minor：它新增「飞书『回复』引用上下文」能力（被回复消息的文本与图片/文件自动并入 prompt，仅读直接父消息，失败 fail-soft），并把正文里的 @ 由整体删除改为渲染成可读的 `@姓名`（保留「@了谁」）。`/agent`、`/model`、session 状态结构与配置保持兼容，不需任何迁移；新增能力默认开启。
 
@@ -39,6 +41,20 @@ v0.2.2 属于 Patch：它增强 CLI 自动发现和错误提示，并新增 Wind
 v0.2.1 属于 Patch：它修复 Windows 普通终端中 CLI 路径不可见导致的 Codex 启动问题，不改变 `/agent` 行为、配置兼容性或状态结构。
 
 v0.2.0 属于 Minor：它新增 Codex 后端和 `/agent` 切换，但保留现有 Claude 行为，并兼容旧配置与旧 session 状态。
+
+## v0.5.1 范围
+
+v0.5.1 包含：
+
+- 安全：默认 `allowed_tools` 移除 `Skill`；启动时向各应用 workspace 根写入 `AGENTS.md` / `CLAUDE.md`，约定 Agent 只返回文本、发图走 `<<<IMG>>>` 协议、禁止自行调飞书 API / `lark-cli` 发消息或查群。
+- 修复：致命配置 / 依赖错误改用退出码 `2`（`CONFIG_ERROR_EXIT`），崩溃（`1`）才自动重启；Claude 会话 sid 改为 run 成功后才落盘；worker 线程异常兜底 + 必清 Typing 表情；流式卡片最终刷新失败退回完整重发；Codex 沙箱首轮与 `resume` 统一用 `-c sandbox_mode=...`。
+- 优化：流式卡片失败退避、claude text 流按块读、`_get_bot_open_id` 复用 token 缓存、`CLAUDE_TIMEOUT`→`AGENT_TIMEOUT`、`.vscode/` 忽略。
+
+v0.5.1 不包含：
+
+- 改变 `/agent`、`/model`、飞书消息语义或 session 状态结构（无需迁移）。
+- 修改各应用真实 `configs/*.json`（不入库，需自行同步 `codex_sandbox` / `allowed_tools` 收敛）。
+- 机器层身份隔离（如为跑桥单独建 OS 账号 / 退出全局 `lark-cli`）——文档建议，非本版本代码改动。
 
 ## v0.5.0 范围
 
